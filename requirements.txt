@@ -1,0 +1,7 @@
+scrapling[fetchers]>=0.2.9
+streamlit>=1.36
+pandas>=2.2
+plotly>=5.22
+tldextract>=5.1
+playwright>=1.44
+playwright-stealth>=2.0

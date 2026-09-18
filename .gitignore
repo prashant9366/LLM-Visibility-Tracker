@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/results.db
+data/profiles/
+data/debug/
+.streamlit/
+.DS_Store
+debug.log
+_test_*.py
+_test_*.log
+_test_*.json
