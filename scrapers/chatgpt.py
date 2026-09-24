@@ -34,6 +34,8 @@ A `page.on('response', ...)` listener captures backend payloads at
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import time
 from urllib.parse import urlencode
 
@@ -44,6 +46,14 @@ from ._browser import (
     wait_for_stable_text,
     make_response_capturer,
     dedupe,
+    release_profile,
+    is_profile_locked_error,
+    _route_block,
+    resource_blocking_enabled,
+    sanitize_profile,
+    CRASH_BUBBLE_ARGS,
+    single_page,
+    SlotPool,
 )
 
 try:
@@ -58,6 +68,12 @@ except Exception:  # pragma: no cover
 # markdown of the latest assistant turn). `[data-message-author-role]` is no
 # longer applied to assistant messages in the anonymous UI. We try a chain.
 RESP_SELECTORS = (
+    # Current anonymous UI (the "octane" /unauth-mweb bundle). Its CSS classes are
+    # stylex hashes that rotate every build, but these data-* attributes are stable.
+    # NOTE the rename: data-message-author-role -> data-message-role.
+    "[data-assistant-markdown]",
+    "[data-message-role='assistant']",
+    # Legacy desktop UI — kept so a logged-in / older render still works.
     ".markdown",
     "[data-message-author-role='assistant']",
     "[data-testid^='conversation-turn'] .markdown",
@@ -101,12 +117,16 @@ _DEBUG_DIR = DATA_DIR / "debug"
 # Persistent Chromium profile dirs are exclusive — one Chrome process per
 # user_data_dir, one shared page reused across keywords. Serialize ChatGPT
 # scrapes so parallel prompts don't fight over the lock / type over each other.
-_SCRAPE_LOCK = asyncio.Lock()
+# A POOL of independent Chromes, not one. Each slot gets its own profile dir
+# (profiles/chatgpt_0, _1, …) — a persistent profile can only back one live
+# browser. CHATGPT_POOL sets the width; 1 restores the old serial behaviour.
+# NOTE each slot clears Cloudflare Turnstile separately on its first load, so a
+# wider pool means more cold starts (see COLD_BUDGET_S and the warm-up note).
+POOL_SIZE = int(os.getenv("CHATGPT_POOL", "3"))
+_POOL = SlotPool(POOL_SIZE)
 
-# The live browser session, reused across keywords (mirrors scrapers/google.py).
-# Bound to the event loop it was created in (each "Run scan" is one
-# asyncio.run → one loop); if the loop changes we tear down and relaunch.
-_SESSION: dict | None = None
+# {slot: session}, each reused across keywords and bound to the loop that made it.
+_SESSIONS: dict[int, dict] = {}
 
 
 async def _dump_failure(page, tag: str) -> None:
@@ -223,34 +243,49 @@ async def _solve_turnstile(page, *, total_timeout_ms: int = 30_000) -> bool:
         return False
 
 
-async def unlock_turnstile(timeout_s: int = 600) -> bool:
-    """Open a headed Chrome window on chatgpt.com so the user can clear the
-    Cloudflare challenge by hand. Persists cf_clearance to the same profile
-    the scraper uses."""
-    async with _SCRAPE_LOCK:
-        async with persistent_context(
-            "chatgpt", headless=False, block_resources=False, engine="patchright",
-        ) as ctx:
-            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-            try:
-                await page.goto(
-                    "https://chatgpt.com/",
-                    wait_until="domcontentloaded",
-                    timeout=60_000,
-                )
-            except Exception:
-                return False
-
-            deadline = time.monotonic() + timeout_s
-            while time.monotonic() < deadline:
-                try:
-                    if await page.locator(COMPOSER_SEL).count():
-                        await page.wait_for_timeout(1500)
-                        return True
-                except Exception:
-                    pass
-                await page.wait_for_timeout(800)
+async def _unlock_one(profile: str, timeout_s: int) -> bool:
+    """Clear Turnstile for ONE profile, leaving cf_clearance behind."""
+    async with persistent_context(
+        profile, headless=False, block_resources=False, engine="patchright",
+    ) as ctx:
+        page = await single_page(ctx)
+        try:
+            await page.goto("https://chatgpt.com/", wait_until="domcontentloaded",
+                            timeout=60_000)
+        except Exception:
             return False
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                if await page.locator(COMPOSER_SEL).count():
+                    await page.wait_for_timeout(1500)
+                    return True
+            except Exception:
+                pass
+            await page.wait_for_timeout(800)
+        return False
+
+
+async def unlock_turnstile(timeout_s: int = 600) -> bool:
+    """Warm EVERY pooled profile so no keyword pays the cold Turnstile stall.
+
+    Each pool slot has its own profile dir, and Cloudflare clearance is per-profile
+    — warming only `chatgpt` would leave chatgpt_0..N-1 cold, so the first keyword
+    on each slot would still hang. Opens them one at a time; a window appears for
+    each, and closes itself once the composer is reachable.
+    """
+    ok = True
+    for i in range(POOL_SIZE):
+        prof = f"chatgpt_{i}"
+        print(f"[chatgpt] warming profile {prof} ({i + 1}/{POOL_SIZE}) …")
+        try:
+            got = await _unlock_one(prof, timeout_s)
+        except Exception as e:
+            print(f"[chatgpt] {prof}: {type(e).__name__}: {str(e)[:80]}")
+            got = False
+        print(f"[chatgpt] {prof}: {'cleared' if got else 'NOT cleared'}")
+        ok = ok and got
+    return ok
 
 
 _SKIP_HOSTS = ("openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com")
@@ -260,45 +295,72 @@ def _is_chatgpt_backend(url: str) -> bool:
     return "chatgpt.com/backend-anon/" in url or "chatgpt.com/backend-api/" in url
 
 
-async def _ensure_session() -> dict:
+async def _ensure_session(slot: int = 0) -> dict:
     """Return a live session for the current loop, launching one headed Chrome
     if needed. Reuses the open Chrome/tab across keywords (the whole point) and
     clears Turnstile once on the homepage so later `?q=` navigations sail through.
     Mirrors scrapers/google.py's `_ensure_session`."""
-    global _SESSION
     loop = asyncio.get_running_loop()
 
-    if _SESSION is not None:
-        same_loop = _SESSION.get("loop") is loop
-        page = _SESSION.get("page")
+    sess = _SESSIONS.get(slot)
+    if sess is not None:
+        same_loop = sess.get("loop") is loop
+        page = sess.get("page")
         try:
             alive = same_loop and page is not None and not page.is_closed()
         except Exception:
             alive = False
         if alive:
-            return _SESSION
-        # Stale (loop changed or page died) — tear it down before relaunching.
-        await close_session()
+            return sess
+        # Stale (loop changed or page died) — tear this slot down before relaunching.
+        await _close_slot(slot)
 
-    user_dir = str(profile_dir("chatgpt"))
+    # Each slot needs its OWN profile: one directory cannot back two live browsers.
+    user_dir = str(profile_dir(f"chatgpt_{slot}"))
+    # A profile left "crashed" opens on the Restore-pages bubble and parks the
+    # tab on about:blank — clear it before every launch, not just after a kill.
+    sanitize_profile(user_dir)
     pw = await async_patchright().start()
     kwargs = dict(
         user_data_dir=user_dir,
         headless=False,  # Turnstile blocks headless regardless of URL — always headed.
         viewport={"width": 1280, "height": 900},
-        args=["--no-default-browser-check"],
+        args=["--no-default-browser-check", *CRASH_BUBBLE_ARGS],
     )
     if _HAS_PATCHRIGHT:
         kwargs["channel"] = "chrome"
         kwargs["no_viewport"] = False
     try:
         ctx = await pw.chromium.launch_persistent_context(**kwargs)
-    except Exception:
-        # Real Chrome missing — fall back to bundled Chromium.
-        kwargs.pop("channel", None)
-        ctx = await pw.chromium.launch_persistent_context(**kwargs)
+    except Exception as e:
+        if is_profile_locked_error(e):
+            # An interrupted run left Chrome holding this profile. Clear it and
+            # retry once, so the user isn't stuck killing processes by hand.
+            n = release_profile(user_dir)
+            print(f"[chatgpt] profile was locked — released ({n} process(es) killed), retrying")
+            ctx = await pw.chromium.launch_persistent_context(**kwargs)
+        else:
+            # Real Chrome missing — fall back to bundled Chromium.
+            kwargs.pop("channel", None)
+            try:
+                ctx = await pw.chromium.launch_persistent_context(**kwargs)
+            except Exception as e2:
+                if not is_profile_locked_error(e2):
+                    raise
+                release_profile(user_dir)
+                ctx = await pw.chromium.launch_persistent_context(**kwargs)
 
-    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    # This context is built here rather than via persistent_context(), so it did NOT
+    # inherit that helper's resource blocking — every keyword was re-downloading
+    # images/fonts/media (the octane bundle, plus a favicon fetch per citation).
+    # We only ever read text and attributes, so none of it is needed.
+    if resource_blocking_enabled():
+        try:
+            await ctx.route("**/*", _route_block)
+        except Exception:
+            pass
+
+    page = await single_page(ctx)
     try:
         await page.goto(
             "https://chatgpt.com/", wait_until="domcontentloaded", timeout=60_000
@@ -310,16 +372,13 @@ async def _ensure_session() -> dict:
     await _solve_turnstile(page)
     await _dismiss_modals(page)
 
-    _SESSION = {"pw": pw, "ctx": ctx, "page": page, "loop": loop}
-    return _SESSION
+    sess = {"pw": pw, "ctx": ctx, "page": page, "loop": loop}
+    _SESSIONS[slot] = sess
+    return sess
 
 
-async def close_session() -> None:
-    """Close the shared Chrome. Called once at the end of a scan batch.
-    No-op if no session (and best-effort if the owning loop already closed)."""
-    global _SESSION
-    sess = _SESSION
-    _SESSION = None
+async def _close_slot(slot: int) -> None:
+    sess = _SESSIONS.pop(slot, None)
     if not sess:
         return
     try:
@@ -332,15 +391,77 @@ async def close_session() -> None:
         pass
 
 
+async def close_session() -> None:
+    """Close EVERY pooled Chrome. Called once at the end of a scan batch.
+    Best-effort if the owning loop already closed."""
+    for slot in list(_SESSIONS):
+        await _close_slot(slot)
+
+
+# Has this process already cleared Turnstile on a live session? The FIRST load of
+# chatgpt.com on a cold profile has to pass the challenge and can take minutes (or
+# stall); every load after it rides the cf_clearance cookie and takes ~8-12s.
+_WARMED = False
+
+# Hard ceilings. A cold profile must clear Turnstile and can stall in a way that
+# ignores page.goto's own timeout (measured: a 150s wait_for overran to 445s), so
+# the whole scrape is bounded here rather than trusting the inner timeouts.
+COLD_BUDGET_S = 100
+WARM_BUDGET_S = 90
+
+
 async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
+    """Scrape one prompt, retrying once if the COLD session never came up.
+
+    Measured: keyword 1 on a fresh session timed out at 150s, keywords 2 and 3 on
+    the same session took 7.9s and 11.4s. That is Turnstile being cleared on the
+    first load. Failing keyword 1 of every scan is not acceptable, so a cold-start
+    failure tears the session down and tries once more — by then the profile holds
+    cf_clearance and the retry is fast.
+    """
+    global _WARMED
+    budget = COLD_BUDGET_S if not _WARMED else WARM_BUDGET_S
+    try:
+        res = await asyncio.wait_for(_scrape_once(prompt, headless), timeout=budget)
+    except asyncio.TimeoutError:
+        res = ScrapeResult(platform="chatgpt", prompt=prompt)
+        res.error = (f"timed out after {budget}s")
+
+    cold_fail = (not res.response_text) and not _WARMED
+    if cold_fail:
+        print("[chatgpt] cold session produced nothing — resetting and retrying once")
+        try:
+            await close_session()
+        except Exception:
+            pass
+        try:
+            res = await asyncio.wait_for(_scrape_once(prompt, headless),
+                                         timeout=COLD_BUDGET_S)
+        except asyncio.TimeoutError:
+            res = ScrapeResult(platform="chatgpt", prompt=prompt)
+            res.error = (
+                "ChatGPT's first load could not clear Cloudflare Turnstile. Warm the "
+                "profile once with:  python3 -m scrapers.login chatgpt   "
+                "(click the 'Verify you are human' box if it appears, then close). "
+                "Later keywords in this scan should work.")
+            try:
+                await close_session()
+            except Exception:
+                pass
+    if res.response_text:
+        _WARMED = True
+    return res
+
+
+async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
     # `headless` is accepted for API parity but intentionally ignored — see
     # project_chatgpt_turnstile memory. Always headed + patchright + real Chrome.
     # The shared session means we hold the lock for the whole search and reuse
     # the one open tab (see module docstring) instead of relaunching Chrome.
     res = ScrapeResult(platform="chatgpt", prompt=prompt)
-    async with _SCRAPE_LOCK:
+    async with _POOL.slot() as slot:
         try:
-            sess = await _ensure_session()
+            sess = await _ensure_session(slot)
             page = sess["page"]
 
             handler, captured_queries, captured_urls = make_response_capturer(
@@ -367,7 +488,9 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
                     return res
 
                 await _solve_turnstile(page)
-                await wait_quiet(page, idle_ms=400)
+                # No networkidle: ChatGPT streams over an open socket so it never
+                # fires; the RESP_SEL wait below is the real readiness signal.
+                await wait_quiet(page, idle_ms=250, net_idle=False)
                 await _dismiss_modals(page)
 
                 # 2. Wait for the assistant turn.
@@ -382,13 +505,17 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
                     page, RESP_SEL, idle_ms=1400, max_ms=180_000, min_chars=80
                 )
 
+                # Wait for the citation chips to attach. The old
+                # [data-testid="webpage-citation-pill"] hook no longer exists in the
+                # anonymous UI, so it could only ever burn its full timeout — every
+                # keyword paid 3s for nothing. Wait on the attribute the sources are
+                # actually read from, which resolves the moment they render.
                 try:
                     await page.wait_for_selector(
-                        '[data-testid="webpage-citation-pill"]', timeout=3000
+                        "[data-assistant-sources-payload]", timeout=2500
                     )
                 except Exception:
                     pass
-                await page.wait_for_timeout(300)
 
                 # ---- DOM extraction ----
                 # Read via `evaluate("e => e.innerText")`, NOT `inner_text()`.
@@ -435,15 +562,47 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
                         continue
                     citations.append(h)
 
+                # The anonymous "octane" UI renders citations as chips
+                # ("C CashKaro +1") that are <button>s, NOT anchors — there is no
+                # href anywhere and nothing in the network payloads. The sources
+                # ride along in a JSON attribute on the chip:
+                #   data-assistant-sources-payload='[{"attribution":"CashKaro",…}]'
+                # Parse the JSON, falling back to a URL regex so a schema rename
+                # still yields the links.
                 try:
-                    pills = await page.locator(
-                        '[data-testid="webpage-citation-pill"] a[href]'
-                    ).evaluate_all(
-                        "els => els.map(e => e.href).filter(h => h && /^https?:/.test(h))"
+                    pills = await page.evaluate(
+                        """() => {
+                            const out = [];
+                            const push = u => {
+                                if (typeof u === 'string' && /^https?:/i.test(u)) out.push(u);
+                            };
+                            document.querySelectorAll(
+                                '[data-assistant-sources-payload]'
+                            ).forEach(el => {
+                                const raw = el.getAttribute(
+                                    'data-assistant-sources-payload') || '';
+                                let parsed = null;
+                                try { parsed = JSON.parse(raw); } catch (e) {}
+                                if (parsed) {
+                                    (Array.isArray(parsed) ? parsed : [parsed]).forEach(s => {
+                                        if (!s || typeof s !== 'object') return;
+                                        ['url', 'link', 'href', 'sourceUrl'].forEach(
+                                            k => push(s[k]));
+                                    });
+                                }
+                                if (!out.length) {
+                                    const m = raw.match(/https?:\\/\\/[^\\s"'<>)\\\\]+/g);
+                                    if (m) m.forEach(push);
+                                }
+                            });
+                            return out;
+                        }"""
                     )
                 except Exception:
                     pills = []
                 for h in pills:
+                    # strip ChatGPT's referral param so domains aggregate cleanly
+                    h = re.sub(r"[?&]utm_source=chatgpt\.com\b", "", h).rstrip("?&")
                     host = h.split("/", 3)[2].lower() if "://" in h else ""
                     if any(s in host for s in _SKIP_HOSTS):
                         continue

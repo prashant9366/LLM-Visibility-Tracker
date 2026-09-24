@@ -1929,9 +1929,12 @@ def _keyword_platform_table_html(
         new_body_rows: list[str] = []
         for kw, row_html in zip(ordered_keys, body_rows):
             row_meta = meta_by_kw.get(kw) or meta_by_kw.get(kw.lower()) or {}
+            # the em-dash fallback is hoisted out: a backslash inside an f-string
+            # expression is a SyntaxError before Python 3.12
+            meta_dash = "<span class='kwmx-muted'>—</span>"
             meta_cells = "".join(
                 "<td class='num kwmx-meta'>"
-                f"{html.escape(str(row_meta.get(c, '')).strip()) or '<span class=\"kwmx-muted\">—</span>'}"
+                f"{html.escape(str(row_meta.get(c, '')).strip()) or meta_dash}"
                 "</td>"
                 for c in meta_cols
             )

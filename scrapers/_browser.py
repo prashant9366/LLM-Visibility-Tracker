@@ -18,6 +18,7 @@ anything JSON/SSE-shaped). Used to diagnose endpoint changes.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -63,10 +64,276 @@ def _debug_log(platform: str, url: str, status: int, ctype: str, body_preview: s
 _BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
 
 
+def resource_blocking_enabled() -> bool:
+    """Whether to intercept and drop image/font/media requests.
+
+    OFF by default. Blocking is a real speed win (a scrape only reads text and
+    attributes), but `ctx.route("**/*")` on the patchright + real-Chrome sessions
+    DEADLOCKS navigation: with the route attached, page.goto() never returns and the
+    tab sits on about:blank forever. Measured directly — identical launch, the only
+    difference being the route:
+
+        route attached  -> goto chatgpt.com hangs (>60s, no timeout fired)
+        no route        -> goto chatgpt.com returns in 1.4s
+
+    It survived a few runs before starting to hang, so it is not reliably safe.
+    Set SCRAPER_BLOCK_RESOURCES=1 to opt in if you want the speed and can watch it.
+    """
+    return (os.getenv("SCRAPER_BLOCK_RESOURCES", "0").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
+# Flags that stop Chrome greeting a killed profile with the crash-restore bubble.
+# NOTE: do NOT add "--restore-last-session=false". Chrome's switch is presence-based,
+# so passing it with =false still reads as PRESENT and turns session restore ON —
+# every run then reopens the previous run's tabs and they pile up.
+CRASH_BUBBLE_ARGS = (
+    "--hide-crash-restore-bubble",
+    "--disable-session-crashed-bubble",
+)
+
+
+def sanitize_profile(user_dir: str) -> None:
+    """Clear Chrome's "didn't shut down correctly" state for a profile.
+
+    A profile whose Chrome was SIGKILLed — by release_profile, a crash, a killed
+    terminal — keeps exit_type="Crashed" in its Preferences. The next launch then
+    shows the "Restore pages?" bubble, which takes focus and leaves the tab sitting
+    on about:blank until someone dismisses it, so the scrape just waits. Rewriting
+    the two flags Chrome checks makes it believe the last exit was clean.
+    """
+    import json
+
+    for rel in ("Default/Preferences", "Preferences"):
+        path = os.path.join(user_dir, rel)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            prof = data.setdefault("profile", {})
+            if prof.get("exit_type") == "Normal" and prof.get("exited_cleanly") is True:
+                continue
+            prof["exit_type"] = "Normal"
+            prof["exited_cleanly"] = True
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+        except Exception:
+            # a corrupt/locked Preferences file is not worth failing the scrape over
+            pass
+
+
+def release_profile(user_dir: str) -> int:
+    """Free a Chromium user-data-dir that a dead run left locked.
+
+    Playwright refuses to open a persistent context whose profile is already in
+    use ("Opening in existing browser session"), which is what you get after a
+    scrape is interrupted — Ctrl-C in Streamlit, a killed terminal, a crash — and
+    the orphaned Chrome keeps the directory. Kill whatever still holds it and drop
+    the singleton locks. Returns how many processes were killed.
+    """
+    import os
+    import signal
+    import subprocess
+
+    killed = 0
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,command="],
+                             capture_output=True, text=True, timeout=10).stdout
+        for line in out.splitlines():
+            if f"--user-data-dir={user_dir}" not in line:
+                continue
+            pid_s = line.strip().split(None, 1)[0]
+            try:
+                os.kill(int(pid_s), signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+    except Exception:
+        pass
+    # Chromium leaves these behind when it dies uncleanly; they alone can block a relaunch.
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            os.unlink(os.path.join(user_dir, name))
+        except OSError:
+            pass
+    # We just SIGKILLed it, so the profile now reads as "crashed" — clear that here
+    # or the next launch opens on the Restore-pages bubble instead of the page.
+    sanitize_profile(user_dir)
+    return killed
+
+
+class SlotPool:
+    """Hands out one of N slots, so a platform can keep N independent sessions.
+
+    Google and ChatGPT each reused ONE browser behind a module-level lock, so every
+    keyword queued behind the previous one — 500 keywords x 20s is 2.8 hours of
+    strictly serial work, and SCRAPE_CONCURRENCY did nothing for them. A slot is
+    just an integer; the platform keeps `{slot: session}` and gives each slot its
+    own profile dir, which is what makes the sessions genuinely independent
+    (a persistent profile can only be open in one browser at a time).
+
+    The queue is rebuilt if the event loop changes — each "Run scan" is one
+    asyncio.run, i.e. a fresh loop, and a Queue is bound to the loop that made it.
+    """
+
+    def __init__(self, size: int):
+        self.size = max(1, int(size))
+        self._q: asyncio.Queue | None = None
+        self._loop = None
+        self._lock = asyncio.Lock()
+
+    async def _queue(self) -> asyncio.Queue:
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            if self._q is None or self._loop is not loop:
+                self._q = asyncio.Queue()
+                for i in range(self.size):
+                    self._q.put_nowait(i)
+                self._loop = loop
+        return self._q
+
+    @asynccontextmanager
+    async def slot(self):
+        q = await self._queue()
+        i = await q.get()
+        try:
+            yield i
+        finally:
+            q.put_nowait(i)
+
+
+def _load_env_file() -> None:
+    """Read the project's .env into the environment.
+
+    Unlike some of the other projects here, this one has no .env loader of its own,
+    so PROXY_USER / PROXY_PASS sat in .env and were never picked up. Parsed inline
+    rather than via python-dotenv, which isn't in requirements.txt. setdefault, so a
+    real exported env var always wins over the file.
+    """
+    path = Path(__file__).resolve().parent.parent / ".env"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+_load_env_file()
+
+
+def proxy_servers() -> list[str]:
+    """Configured proxies as 'host:port', from PROXY_LIST or a proxies file.
+
+    PROXY_LIST="1.2.3.4:8000,5.6.7.8:8000"  takes precedence; otherwise the file at
+    PROXY_FILE (default: proxies.txt beside the app) is read, one per line, '#'
+    comments allowed. Empty result = no proxying, which is the default.
+    """
+    raw = (os.getenv("PROXY_LIST") or "").strip()
+    if raw:
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    path = (os.getenv("PROXY_FILE") or "").strip() or str(
+        Path(__file__).resolve().parent.parent / "proxies.txt")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return [ln.strip() for ln in fh
+                    if ln.strip() and not ln.strip().startswith("#")]
+    except OSError:
+        return []
+
+
+def proxy_config(pick: str | None = None,
+                 exclude: "set[str] | tuple[str, ...]" = ()) -> dict | None:
+    """Playwright proxy dict, or None when no proxies are configured.
+
+    Credentials come from PROXY_USER / PROXY_PASS (env or .env) — never from the
+    proxy list itself, so the list can be committed/shared without leaking them.
+
+    A persistent session is reused across every keyword in a batch, so the proxy is
+    chosen once per LAUNCH, not per keyword; rotation happens whenever the session
+    is rebuilt. Pass `pick` to force a specific one.
+    """
+    servers = proxy_servers()
+    if not servers:
+        return None
+    import random
+    if not pick:
+        # Skip exits that have already been CAPTCHA-walled. If every one is burned,
+        # fall back to the full list rather than refusing to run — a flagged IP
+        # usually recovers after a while, so retrying beats stopping.
+        fresh = [s for s in servers if s not in set(exclude)]
+        pick = random.choice(fresh or servers)
+    server = pick
+    cfg = {"server": server if "://" in server else f"http://{server}"}
+    user = (os.getenv("PROXY_USER") or "").strip()
+    password = (os.getenv("PROXY_PASS") or "").strip()
+    if user:
+        cfg["username"] = user
+    if password:
+        cfg["password"] = password
+    return cfg
+
+
+async def single_page(ctx):
+    """Return ONE page for this context, closing every other tab.
+
+    A persistent profile can come back with tabs from a previous run (session
+    restore, a popup, a crashed shutdown). Blindly taking pages[0] then leaves the
+    extras open — they accumulate every run, and the scraper may end up driving a
+    tab that isn't the one it navigated. Collapse to a single tab each time.
+    """
+    try:
+        pages = list(ctx.pages)
+    except Exception:
+        pages = []
+    if not pages:
+        return await ctx.new_page()
+    page = pages[0]
+    for extra in pages[1:]:
+        try:
+            await extra.close()
+        except Exception:
+            pass
+    return page
+
+
+def is_profile_locked_error(exc: Exception) -> bool:
+    """True for the 'profile already in use' launch failure specifically."""
+    msg = str(exc)
+    return ("Opening in existing browser session" in msg
+            or "already in use" in msg
+            or "ProcessSingleton" in msg)
+
+
 async def _route_block(route):
-    if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
-        return await route.abort()
-    return await route.continue_()
+    """Abort image/font/media, let everything else through.
+
+    Every call is guarded: an interception handler that raises leaves its request
+    hanging forever, and the page then sits on a spinning about:blank until the
+    navigation timeout. A route that's already been handled (or whose page is
+    closing) raises exactly that way, so failures must degrade to "let it load"
+    rather than propagate.
+    """
+    try:
+        blocked = route.request.resource_type in _BLOCKED_RESOURCE_TYPES
+    except Exception:
+        blocked = False
+    try:
+        if blocked:
+            await route.abort()
+        else:
+            await route.continue_()
+    except Exception:
+        # last resort: try to release the request so it can't hang the page
+        try:
+            await route.continue_()
+        except Exception:
+            pass
 
 
 @asynccontextmanager
@@ -85,6 +352,9 @@ async def persistent_context(
         matches a real browser.
     """
     user_dir = str(profile_dir(platform))
+    # Clear any "crashed" marker first, or Chrome opens on the Restore-pages bubble
+    # and the tab sits on about:blank waiting to be dismissed.
+    sanitize_profile(user_dir)
     use_patchright = engine == "patchright" and _HAS_PATCHRIGHT
     runner = async_patchright if use_patchright else async_playwright
     async with runner() as p:
@@ -99,21 +369,34 @@ async def persistent_context(
             # are not overridden.
             kwargs["channel"] = "chrome"
             kwargs["no_viewport"] = False
-            kwargs["args"] = ["--no-default-browser-check"]
+            kwargs["args"] = ["--no-default-browser-check", *CRASH_BUBBLE_ARGS]
         else:
             kwargs["args"] = [
                 "--disable-blink-features=AutomationControlled",
                 "--no-default-browser-check",
+                *CRASH_BUBBLE_ARGS,
             ]
         try:
             ctx = await p.chromium.launch_persistent_context(**kwargs)
-        except Exception:
-            # patchright with channel='chrome' fails if Chrome isn't installed.
-            # Fall back to bundled Chromium so the scrape still runs (Turnstile
-            # may still gate it but at least we get a clear error path).
-            if use_patchright and "channel" in kwargs:
-                kwargs.pop("channel", None)
+        except Exception as e:
+            if is_profile_locked_error(e):
+                # An interrupted run left Chrome holding this profile — clear and retry.
+                n = release_profile(user_dir)
+                print(f"[{platform}] profile was locked — released "
+                      f"({n} process(es) killed), retrying")
                 ctx = await p.chromium.launch_persistent_context(**kwargs)
+            elif use_patchright and "channel" in kwargs:
+                # patchright with channel='chrome' fails if Chrome isn't installed.
+                # Fall back to bundled Chromium so the scrape still runs (Turnstile
+                # may still gate it but at least we get a clear error path).
+                kwargs.pop("channel", None)
+                try:
+                    ctx = await p.chromium.launch_persistent_context(**kwargs)
+                except Exception as e2:
+                    if not is_profile_locked_error(e2):
+                        raise
+                    release_profile(user_dir)
+                    ctx = await p.chromium.launch_persistent_context(**kwargs)
             else:
                 raise
         if block_resources:
@@ -132,7 +415,7 @@ async def new_page(
     async with persistent_context(
         platform, headless=headless, block_resources=block_resources, engine=engine,
     ) as ctx:
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        page = await single_page(ctx)
         # patchright already patches navigator.webdriver et al at the binary
         # level; injecting playwright-stealth on top of it can RE-LEAK tells
         # (the two patch sets fight). Skip stealth when using patchright.
@@ -163,20 +446,26 @@ async def new_page(
 
 async def wait_quiet(
     page: Page, *, idle_ms: int = 800, timeout_ms: int = 90_000,
-    net_idle_timeout_ms: int = 6_000,
+    net_idle_timeout_ms: int = 6_000, net_idle: bool = True,
 ) -> None:
-    """Wait for DOM + a short networkidle window, then a tail idle.
+    """Wait for DOM + (optionally) a short networkidle window, then a tail idle.
 
     `net_idle_timeout_ms` caps the networkidle wait separately from
     `timeout_ms`. Streaming SPAs (ChatGPT, Gemini) keep long-poll sockets open
     and never hit networkidle, so pinning it to the full 90s stalled every
-    call. 6s is enough for the shell to settle and cheap when it doesn't."""
+    call. 6s is enough for the shell to settle and cheap when it doesn't.
+
+    Pass `net_idle=False` when the caller immediately waits on a real selector
+    anyway: on those SPAs the networkidle wait never succeeds, so it just burns
+    its whole timeout on every prompt before the useful wait even starts."""
     await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=net_idle_timeout_ms)
-    except Exception:
-        pass
-    await page.wait_for_timeout(idle_ms)
+    if net_idle:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=net_idle_timeout_ms)
+        except Exception:
+            pass
+    if idle_ms:
+        await page.wait_for_timeout(idle_ms)
 
 
 async def wait_for_stable_text(

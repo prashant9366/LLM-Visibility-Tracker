@@ -27,6 +27,9 @@ class ScrapeResult:
     fanout_queries: List[str] = field(default_factory=list)
     error: str = ""
     raw_html_path: str = ""
+    # Wall-clock seconds this single prompt x platform scrape took. Filled in by the
+    # caller (app._one) so every platform is measured the same way.
+    duration_s: float = 0.0
 
     def to_row(self) -> dict:
         d = asdict(self)

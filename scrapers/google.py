@@ -1,4 +1,4 @@
-"""Google AI Overview (google.com SERP) scraper.
+"""Google AI Overview (google.co.in SERP, India region) scraper.
 
 Google's AI Overview ("AIO") is the generative summary block at the top of a
 results page. Unlike the chat platforms there is no public backend payload to
@@ -22,11 +22,15 @@ handle one search at a time.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from urllib.parse import urlparse, parse_qs
 
 from .base import ScrapeResult, DATA_DIR, profile_dir
-from ._browser import dedupe
+from ._browser import (dedupe, release_profile, is_profile_locked_error,
+                       _route_block, resource_blocking_enabled,
+                       sanitize_profile, CRASH_BUBBLE_ARGS, single_page,
+                       proxy_config, SlotPool)
 
 try:
     from patchright.async_api import async_playwright as async_patchright  # type: ignore
@@ -38,14 +42,25 @@ except Exception:  # pragma: no cover
 
 _DEBUG_DIR = DATA_DIR / "debug"
 
-# One shared Chrome per profile dir → serialize scrapes so concurrent prompts
-# don't type over each other on the single reused page.
-_SCRAPE_LOCK = asyncio.Lock()
+# A POOL of independent Chromes, not one. Each slot gets its own profile dir
+# (profiles/google_0, _1, …) because a persistent profile can only be open in one
+# browser at a time. GOOGLE_POOL sets the width: 1 restores the old serial
+# behaviour, 3 is the default (500 keywords: ~2.8h serial → ~1h).
+# More sessions = more concurrent traffic to Google, so raising this raises
+# CAPTCHA risk; proxies help spread it across exit IPs.
+# Exits that Google has CAPTCHA-walled this run. Skipped when picking a proxy for
+# a new session; if every exit is burned the picker falls back to the full list,
+# since a flagged IP usually recovers.
+_BURNED_PROXIES: set[str] = set()
+# How many times one keyword may rotate to a fresh exit before giving up.
+CAPTCHA_ROTATIONS = int(os.getenv("GOOGLE_CAPTCHA_ROTATIONS", "2"))
 
-# The live browser session, reused across keywords. Bound to the event loop it
-# was created in (each "Run scan" is one asyncio.run → one loop); if the loop
-# changes we tear down and relaunch.
-_SESSION: dict | None = None
+POOL_SIZE = int(os.getenv("GOOGLE_POOL", "3"))
+_POOL = SlotPool(POOL_SIZE)
+
+# {slot: session}. Each is reused across keywords like the old single session was,
+# and is bound to the event loop that created it.
+_SESSIONS: dict[int, dict] = {}
 
 # Hosts that are Google's own chrome, not a cited source.
 _SKIP_HOSTS = (
@@ -54,7 +69,26 @@ _SKIP_HOSTS = (
 )
 
 # Search box: Google moved the homepage input from <input> to <textarea>.
-_SEARCH_BOX = "textarea[name='q'], input[name='q']"
+#
+# :visible is essential. A SERP also carries a HIDDEN <input name="q"> holding an
+# opaque continuation token, and it comes first in DOM order — so a bare
+# "textarea[name='q'], input[name='q']" with .first resolved to that hidden input.
+# Typing then went nowhere useful and reads came back as token gibberish
+# ("EgRrrzp2GKGVw9UG..."), which is why keywords after the first searched garbage.
+_SEARCH_BOX = "textarea[name='q']:visible, input[name='q']:visible"
+
+# Search as if from India. This matters MORE once proxies are on: the proxy pool
+# exits from US IPs, and plain google.com would then serve US results — silently
+# changing what the tracker measures. The .co.in domain plus gl=IN pins the result
+# region; hl=en-IN the interface; pws=0 drops personalisation so runs are
+# comparable. Override with GOOGLE_HOME / GOOGLE_GL / GOOGLE_HL if you ever want a
+# different market.
+GOOGLE_GL = os.getenv("GOOGLE_GL", "IN")
+GOOGLE_HL = os.getenv("GOOGLE_HL", "en-IN")
+GOOGLE_HOME = os.getenv(
+    "GOOGLE_HOME",
+    f"https://www.google.co.in/?hl={GOOGLE_HL}&gl={GOOGLE_GL}&pws=0",
+)
 
 _CONSENT_SELECTORS = (
     "button#L2AGLb",                       # classic "Accept all"
@@ -93,19 +127,70 @@ _EXTRACT_JS = r"""
 """
 
 
-def _unwrap(url: str) -> str:
-    """Resolve Google redirect wrappers (/url?q=, /aclk?...&url=) to the real
-    destination so the cited host is the publisher, not google.com."""
+# Google wraps every AI Overview citation in a redirect. /url?q= carried the
+# destination in plain text; /goto?url= (the current AIO format) carries an OPAQUE
+# protobuf token instead, so the publisher cannot be parsed out of the href at all —
+# only the redirect itself knows it. See _resolve_redirects.
+_REDIRECT_PATHS = ("/goto", "/url", "/aclk", "/imgres")
+
+
+def _is_google_redirect(url: str) -> bool:
     try:
         pr = urlparse(url)
-        if "google." in pr.netloc.lower() and pr.path in ("/url", "/aclk", "/imgres"):
+        return "google." in pr.netloc.lower() and pr.path in _REDIRECT_PATHS
+    except Exception:
+        return False
+
+
+def _unwrap(url: str) -> str:
+    """Resolve Google redirect wrappers (/url?q=, /aclk?...&url=) to the real
+    destination so the cited host is the publisher, not google.com.
+
+    Only works when the destination is a plain URL in the query string. The AIO
+    /goto?url=CAES... token is not, and falls through unchanged — _resolve_redirects
+    handles those by actually following the redirect."""
+    try:
+        pr = urlparse(url)
+        if "google." in pr.netloc.lower() and pr.path in _REDIRECT_PATHS:
             qs = parse_qs(pr.query)
             for key in ("url", "q", "u"):
-                if qs.get(key):
-                    return qs[key][0]
+                val = (qs.get(key) or [""])[0]
+                if val.startswith(("http://", "https://")):
+                    return val
     except Exception:
         pass
     return url
+
+
+async def _resolve_redirects(page, urls: list[str], *, limit: int = 8) -> dict[str, str]:
+    """Follow Google's redirect wrappers to their real destinations.
+
+    Requests go through the page's own context so they carry its cookies and look
+    like the same session. Deduped first — the AIO repeats the same source link for
+    every sentence that cites it (24 anchors collapsed to 8 links in testing) — and
+    run concurrently, since each redirect costs ~1s and serial resolution would add
+    ~9s to every keyword.
+
+    Returns {wrapper_url: final_url}; wrappers that fail are simply absent.
+    """
+    uniq = [u for u in dict.fromkeys(urls) if _is_google_redirect(u)]
+    if not uniq:
+        return {}
+    req = page.context.request
+    sem = asyncio.Semaphore(limit)
+    out: dict[str, str] = {}
+
+    async def _one(u: str) -> None:
+        async with sem:
+            try:
+                r = await req.get(u, max_redirects=5, timeout=15_000)
+                if r.url and r.url != u:
+                    out[u] = r.url
+            except Exception:
+                pass
+
+    await asyncio.gather(*(_one(u) for u in uniq))
+    return out
 
 
 def _is_source(url: str) -> bool:
@@ -176,59 +261,89 @@ async def _dismiss_consent(page) -> None:
             pass
 
 
-async def _ensure_session(headless: bool) -> dict:
-    """Return a live session for the current loop, launching one if needed.
+async def _ensure_session(headless: bool, slot: int = 0) -> dict:
+    """Return a live session for THIS slot, launching one if needed.
     Reuses the open Chrome/tab across keywords (the whole point)."""
-    global _SESSION
     loop = asyncio.get_running_loop()
 
-    if _SESSION is not None:
-        same_loop = _SESSION.get("loop") is loop
-        page = _SESSION.get("page")
+    sess = _SESSIONS.get(slot)
+    if sess is not None:
+        same_loop = sess.get("loop") is loop
+        page = sess.get("page")
         try:
             alive = same_loop and page is not None and not page.is_closed()
         except Exception:
             alive = False
         if alive:
-            return _SESSION
-        # Stale (loop changed or page died) — tear it down before relaunching.
-        await close_session()
+            return sess
+        # Stale (loop changed or page died) — tear this slot down before relaunching.
+        await _close_slot(slot)
 
-    user_dir = str(profile_dir("google"))
+    # Each slot needs its OWN profile: one directory cannot back two live browsers.
+    user_dir = str(profile_dir(f"google_{slot}"))
+    # A profile left "crashed" opens on the Restore-pages bubble and parks the tab
+    # on about:blank — clear it before every launch, not just after a kill.
+    sanitize_profile(user_dir)
     pw = await async_patchright().start()
     kwargs = dict(
         user_data_dir=user_dir,
         headless=False,  # AIO + bot-detection: always headed, like ChatGPT.
         viewport={"width": 1280, "height": 900},
-        args=["--no-default-browser-check"],
+        args=["--no-default-browser-check", *CRASH_BUBBLE_ARGS],
     )
+    # Route through a proxy when one is configured (proxies.txt / PROXY_LIST).
+    # Chosen per LAUNCH, not per keyword: the session is deliberately reused across
+    # a whole batch, so rotation happens when the session is rebuilt.
+    _proxy = proxy_config(exclude=_BURNED_PROXIES)
+    if _proxy:
+        kwargs["proxy"] = _proxy
+        print(f"[google] slot {slot} via proxy {_proxy['server']}")
     if _HAS_PATCHRIGHT:
         kwargs["channel"] = "chrome"
         kwargs["no_viewport"] = False
     try:
         ctx = await pw.chromium.launch_persistent_context(**kwargs)
-    except Exception:
-        # Real Chrome missing — fall back to bundled Chromium.
-        kwargs.pop("channel", None)
-        ctx = await pw.chromium.launch_persistent_context(**kwargs)
+    except Exception as e:
+        if is_profile_locked_error(e):
+            # An interrupted run left Chrome holding this profile — clear and retry.
+            n = release_profile(user_dir)
+            print(f"[google] profile was locked — released ({n} process(es) killed), retrying")
+            ctx = await pw.chromium.launch_persistent_context(**kwargs)
+        else:
+            # Real Chrome missing — fall back to bundled Chromium.
+            kwargs.pop("channel", None)
+            try:
+                ctx = await pw.chromium.launch_persistent_context(**kwargs)
+            except Exception as e2:
+                if not is_profile_locked_error(e2):
+                    raise
+                release_profile(user_dir)
+                ctx = await pw.chromium.launch_persistent_context(**kwargs)
 
-    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    # Built here rather than via persistent_context(), so it didn't inherit that
+    # helper's resource blocking — every search was re-downloading images/fonts/media
+    # (a SERP is image-heavy). We only read text and hrefs.
+    if resource_blocking_enabled():
+        try:
+            await ctx.route("**/*", _route_block)
+        except Exception:
+            pass
+
+    page = await single_page(ctx)
     try:
-        await page.goto("https://www.google.com/?hl=en", wait_until="domcontentloaded", timeout=60_000)
+        await page.goto(GOOGLE_HOME, wait_until="domcontentloaded", timeout=60_000)
     except Exception:
         pass
     await _dismiss_consent(page)
 
-    _SESSION = {"pw": pw, "ctx": ctx, "page": page, "loop": loop}
-    return _SESSION
+    sess = {"pw": pw, "ctx": ctx, "page": page, "loop": loop,
+            "proxy": (_proxy or {}).get("server", "")}
+    _SESSIONS[slot] = sess
+    return sess
 
 
-async def close_session() -> None:
-    """Close the shared Chrome. Called once at the end of a scan batch.
-    No-op if no session (and best-effort if the owning loop already closed)."""
-    global _SESSION
-    sess = _SESSION
-    _SESSION = None
+async def _close_slot(slot: int) -> None:
+    sess = _SESSIONS.pop(slot, None)
     if not sess:
         return
     try:
@@ -241,6 +356,13 @@ async def close_session() -> None:
         pass
 
 
+async def close_session() -> None:
+    """Close EVERY pooled Chrome. Called once at the end of a scan batch.
+    Best-effort if the owning loop already closed."""
+    for slot in list(_SESSIONS):
+        await _close_slot(slot)
+
+
 async def _run_search(page, prompt: str) -> None:
     """Type `prompt` into the search box (clearing any previous query) and
     submit — the human flow, reusing the open tab. Never navigates by URL."""
@@ -248,8 +370,34 @@ async def _run_search(page, prompt: str) -> None:
     await box.wait_for(state="visible", timeout=20_000)
     await box.click()
     # Clear whatever the previous keyword left behind.
-    await page.keyboard.press("Control+A")
-    await page.keyboard.press("Delete")
+    #
+    # This used to be Control+A then Delete. On macOS Ctrl+A is the emacs
+    # "move to start of line" binding, NOT select-all (that is Cmd+A), so the box
+    # was never cleared: the caret jumped to the front, Delete ate a single
+    # character, and the next keyword was typed in FRONT of the previous one.
+    # Over a batch the query grew into a run-on string —
+    #   "ways to save on bus tickets in India" + "hotel booking coupon code"
+    #     -> "ways to save on bus tickets in Indiaotel booking coupon code"
+    # (note the missing 'h') — so every keyword after the first searched garbage.
+    # fill("") clears the field directly and is platform-independent.
+    try:
+        await box.fill("")
+    except Exception:
+        # Fall back to a real select-all if fill is refused by the element.
+        await page.keyboard.press("Meta+A")
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Delete")
+    # Verify it actually emptied — a stale value here corrupts the search.
+    try:
+        left = await box.input_value()
+    except Exception:
+        left = ""
+    if left:
+        try:
+            await box.press("Meta+A")
+            await box.press("Backspace")
+        except Exception:
+            pass
     await box.type(prompt, delay=18)
     await page.wait_for_timeout(250)
     await page.keyboard.press("Enter")
@@ -310,9 +458,11 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
     # `headless` accepted for API parity but ignored — always headed (see module
     # docstring). The shared session means we hold the lock for the whole search.
     res = ScrapeResult(platform="google", prompt=prompt)
-    async with _SCRAPE_LOCK:
+    async with _POOL.slot() as slot:
+      rotations = 0
+      while True:
         try:
-            sess = await _ensure_session(headless)
+            sess = await _ensure_session(headless, slot)
             page = sess["page"]
             try:
                 await _run_search(page, prompt)
@@ -325,8 +475,22 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
 
             # Detect the sorry/CAPTCHA wall (rare with real Chrome + profile).
             if "/sorry/" in page.url:
+                # This exit is flagged. Burn it, rebuild the slot on a fresh proxy
+                # and try the same keyword again rather than losing it — the wall
+                # is tied to the IP, so a different exit usually sails through.
+                burned = sess.get("proxy") or ""
+                if burned and rotations < CAPTCHA_ROTATIONS:
+                    _BURNED_PROXIES.add(burned)
+                    rotations += 1
+                    print(f"[google] CAPTCHA on {burned} — rotating "
+                          f"({rotations}/{CAPTCHA_ROTATIONS})")
+                    await _close_slot(slot)
+                    continue
                 await _dump_failure(page, "captcha")
-                res.error = "Google CAPTCHA wall — solve it in the open window, then re-run."
+                res.error = (
+                    "Google CAPTCHA wall on every exit tried"
+                    if burned else
+                    "Google CAPTCHA wall — solve it in the open window, then re-run.")
                 return res
 
             data = await _await_ai_overview(page)
@@ -335,12 +499,19 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
                 return res
 
             res.response_text = _clean_text(data.get("text") or "")
+            raw_links = data.get("links") or []
+            # AIO citations are /goto?url=<opaque token>; only the redirect knows
+            # the publisher, so resolve those before filtering. Without this every
+            # citation looks like www.google.com and gets dropped by _is_source.
+            resolved = await _resolve_redirects(page, raw_links)
             cites: list[str] = []
-            for h in data.get("links") or []:
-                u = _unwrap(h)
+            for h in raw_links:
+                u = resolved.get(h) or _unwrap(h)
                 if _is_source(u):
                     cites.append(u)
             res.citations = dedupe(cites)
+            return res                      # success — leave the rotation loop
         except Exception as e:
             res.error = f"{type(e).__name__}: {e}"
+            return res                      # don't spin: only a CAPTCHA retries
     return res

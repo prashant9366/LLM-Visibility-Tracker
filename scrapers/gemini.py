@@ -12,8 +12,10 @@ union that with the backend-extracted URLs.
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from .base import ScrapeResult, DATA_DIR
 from ._browser import (
@@ -35,10 +37,42 @@ RESP_SELECTORS = (
 RESP_SEL = ", ".join(RESP_SELECTORS)
 
 _SKIP_HOSTS = (
-    "google.com", "googleusercontent.com", "gstatic.com", "googletagmanager.com",
-    "doubleclick.net", "google-analytics.com", "youtube.com",
+    # "google." (not "google.com") so regional hosts are caught too — the UI chrome
+    # link www.google.co.in/intl/en/about/products was leaking into citations
+    # because "google.com" is not a substring of "www.google.co.in".
+    "google.", "googleusercontent.com", "gstatic.com", "googletagmanager.com",
+    "doubleclick.net", "google-analytics.com", "youtube.com", "ytimg.com",
     "schema.org", "w3.org", "ogp.me", "gemini.google",
 )
+
+
+def _clean_url(u: str) -> str:
+    """Normalise a Gemini URL so the same source can't be counted several times.
+
+    The aggregator does groupby(domain).size(), so every spelling of one link
+    inflates that domain. Gemini produces four of them for a single source:
+        https://cashkaro.com/?utm_source=gemini
+        https://cashkaro.com?utm_source=gemini
+        https://cashkaro.com?utm_source          (capture truncates at the '=')
+        https://cashkaro.com
+    plus one per quoted sentence via scroll-to-text fragments. This collapses all
+    of them to a single canonical form:
+      * drop `#:~:text…` (split without the '=' — the capture sometimes truncates there)
+      * drop utm_* tracking params, including a valueless truncated one
+      * drop a bare-host trailing slash
+    """
+    if not u:
+        return u
+    u = u.split("#:~:text")[0].rstrip("#")
+    u = re.sub(r"[?&]utm_[a-z_]*(?:=[^&]*)?", "", u)
+    u = u.rstrip("?&")
+    try:
+        p = urlsplit(u)
+        path = "" if p.path == "/" else p.path
+        u = urlunsplit((p.scheme, p.netloc, path, p.query, ""))
+    except Exception:
+        pass
+    return u
 
 
 def _is_gemini_backend(url: str) -> bool:
@@ -137,7 +171,14 @@ async def _collect_gemini_urls(page) -> list[str]:
 
 
 async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
+    # Store the ORIGINAL keyword: the stored prompt is what joins a Gemini row to the
+    # other platforms' rows in Compare Reports / the keyword matrix, so it must stay
+    # the keyword itself.
     res = ScrapeResult(platform="gemini", prompt=prompt)
+    # ASK with the nudge. Plain, anonymous Gemini renders citations as chips with no
+    # href (the deep scan found zero usable anchors); asking "with link" makes it emit
+    # an Official Website table whose cells are real anchors we can actually read.
+    ask = prompt if (prompt and "with link" in prompt.lower()) else f"{prompt} with link"
     try:
         async with new_page("gemini", headless=headless) as page:
             handler, captured_queries, captured_urls = make_response_capturer(
@@ -151,7 +192,9 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )
-            await wait_quiet(page, idle_ms=800)
+            # No networkidle: Gemini holds long-poll sockets open so it never
+            # fires, and the composer wait below is the real readiness signal.
+            await wait_quiet(page, idle_ms=250, net_idle=False)
 
             # Composer selector chain — Gemini renames the Angular components
             # every few weeks, and cold loads need up to ~15s for the shell to
@@ -195,7 +238,7 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
                 return res
 
             await composer.click()
-            await composer.fill(prompt)
+            await composer.fill(ask)
             await page.keyboard.press("Enter")
 
             try:
@@ -221,8 +264,24 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
                     "sources-list sources-sidebar-button button"
                 ).first
                 if await btn.count():
+                    # Was a flat 2.5s sleep. Count external anchors before the
+                    # click, then poll until NEW ones appear — that's the sources
+                    # carousel attaching its hrefs, and it needs no guess at
+                    # Gemini's component names. 2.5s stays as the ceiling, so the
+                    # worst case is exactly the old behaviour.
+                    _ANCHORS = "() => document.querySelectorAll('a[href^=\"http\"]').length"
+                    try:
+                        before = await page.evaluate(_ANCHORS)
+                    except Exception:
+                        before = 0
                     await btn.click(timeout=3000)
-                    await page.wait_for_timeout(2500)
+                    for _ in range(10):
+                        await page.wait_for_timeout(250)
+                        try:
+                            if await page.evaluate(_ANCHORS) > before:
+                                break
+                        except Exception:
+                            break
             except Exception:
                 pass
 
@@ -306,15 +365,29 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
             # does this, so captured_urls is clean).
             dom_clean: list[str] = []
             for u in dom_urls:
+                u = _clean_url(u)
                 if not u or len(u) > 600:
                     continue
                 host = u.split("/", 3)[2].lower() if "://" in u else ""
-                if any(s in host or s in u for s in _SKIP_HOSTS):
+                if any(s in host for s in _SKIP_HOSTS):
                     continue
                 dom_clean.append(u)
 
+            # Anonymous Gemini exposes no citation hrefs in the DOM at all — the
+            # grounding URLs only arrive over the backend stream. Clean those the
+            # same way so both fields dedupe consistently.
+            src_clean: list[str] = []
+            for u in captured_urls:
+                u = _clean_url(u)
+                if not u or len(u) > 600:
+                    continue
+                host = u.split("/", 3)[2].lower() if "://" in u else ""
+                if any(s in host for s in _SKIP_HOSTS):
+                    continue
+                src_clean.append(u)
+
             res.citations = dedupe(dom_clean)
-            res.source_urls = dedupe(captured_urls)
+            res.source_urls = dedupe(src_clean)
             res.fanout_queries = dedupe(captured_queries)
 
     except Exception as e:

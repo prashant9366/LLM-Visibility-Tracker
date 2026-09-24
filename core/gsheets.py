@@ -68,6 +68,27 @@ def _looks_like_header(value: str) -> bool:
     return v in _HEADER_HINTS or len(v) <= 1
 
 
+def _keep_duplicates() -> bool:
+    """True when repeated keywords should be preserved (load testing).
+
+    Set by the "Keep duplicate keywords" checkbox, or ALLOW_DUPLICATE_KEYWORDS=1
+    for headless/CI runs. Off by default: a normal scan should not scrape the same
+    keyword twice.
+    """
+    import os
+    try:
+        # streamlit is imported per-function in this module, not at module level —
+        # referencing a bare `st` here would raise NameError, and the except below
+        # would swallow it, silently ignoring the checkbox.
+        import streamlit as _st
+        if _st.session_state.get("allow_duplicate_keywords"):
+            return True
+    except Exception:
+        pass
+    return os.getenv("ALLOW_DUPLICATE_KEYWORDS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _dedupe_case_insensitive(values: list[str]) -> list[str]:
     """Keep first-seen casing; drop later duplicates that only differ in case."""
     seen: set[str] = set()
@@ -417,10 +438,12 @@ def render_terms_source_sidebar(
     if fetched_key not in st.session_state:
         st.session_state[fetched_key] = persisted["fetched_at"]
 
+    # No `default=`: src_key is always seeded in session_state just above, and
+    # Streamlit warns ("created with a default value but also had its value set
+    # via the Session State API") when a widget is given both.
     source = st.segmented_control(
         label,
         ["Manual", "Google Sheet", "Excel"],
-        default=st.session_state.get(src_key, "Manual"),
         label_visibility="collapsed",
         key=src_key,
     ) or "Manual"
@@ -579,10 +602,11 @@ def render_input_source_sidebar(
     if tab_key not in st.session_state:
         st.session_state[tab_key] = persisted["sheet_tab"]
 
+    # No `default=` — see the note on the other segmented_control: src_key is
+    # already seeded in session_state, and passing both triggers Streamlit's warning.
     source = st.segmented_control(
         "Input Source",
         ["Manual", "Google Sheet", "Excel"],
-        default=st.session_state.get(src_key, "Manual"),
         label_visibility="collapsed",
         key=src_key,
     ) or "Manual"
@@ -602,6 +626,12 @@ def render_input_source_sidebar(
                 s = chunk.strip()
                 if s:
                     parts.append(s)
+        # Repeats are normally collapsed so a scan never pays twice for one query.
+        # The "Keep duplicate keywords" checkbox turns that off for load testing —
+        # honoured HERE because this is where the manual box is actually deduped;
+        # anything downstream never sees the repeats.
+        if _keep_duplicates():
+            return parts
         return _dedupe_case_insensitive(parts)
 
     # ---------- Google Sheet ----------

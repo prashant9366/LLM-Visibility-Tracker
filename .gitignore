@@ -11,3 +11,10 @@ debug.log
 _test_*.py
 _test_*.log
 _test_*.json
+
+# proxy list (infrastructure, not for the repo)
+proxies.txt
+
+# secrets — never commit
+# .env
+# .env.*

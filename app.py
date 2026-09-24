@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import os
 import io
 import json
 import re
@@ -1639,6 +1640,16 @@ def collect_prompts(csv_file, text_blob: str) -> list[str]:
             except Exception:
                 st.error("Could not parse uploaded file as CSV or Excel.")
     prompts.extend([ln.strip() for ln in text_blob.splitlines() if ln.strip()])
+    # Duplicates are dropped so the same keyword isn't scraped twice by accident.
+    # For LOAD TESTING that's the wrong behaviour — pasting one keyword 500 times
+    # would run a single scrape — so keep them when the UI checkbox is ticked, or
+    # ALLOW_DUPLICATE_KEYWORDS=1 is set (useful for headless/CI runs).
+    _keep = bool(st.session_state.get("allow_duplicate_keywords"))
+    if not _keep:
+        _keep = os.getenv("ALLOW_DUPLICATE_KEYWORDS", "").strip().lower() in (
+            "1", "true", "yes", "on")
+    if _keep:
+        return prompts
     seen, out = set(), []
     for p in prompts:
         if p not in seen:
@@ -1648,15 +1659,34 @@ def collect_prompts(csv_file, text_blob: str) -> list[str]:
 
 async def _one(plat: str, prm: str, headless: bool) -> dict:
     fn = SCRAPERS[plat]
+    _t0 = time.monotonic()
     try:
         r = await fn(prm, headless=headless)
     except Exception as e:
         r = ScrapeResult(platform=plat, prompt=prm, error=f"{type(e).__name__}: {e}")
+    # measured here so every platform is timed identically, failures included
+    r.duration_s = round(time.monotonic() - _t0, 1)
     return r.to_row()
 
 
+def _default_concurrency() -> int:
+    """Prompts processed at once. Override with SCRAPE_CONCURRENCY=N.
+
+    Left at 4 by default because RAM scales with it — Gemini and Perplexity each
+    launch their own browser per prompt, so N=4 can mean ~8 live Chromium
+    processes. Raise it on a machine with headroom; that is the single biggest
+    throughput lever here, since per-prompt time is dominated by the model
+    streaming its answer, which no amount of tuning shortens.
+    """
+    import os
+    try:
+        return max(1, int(os.getenv("SCRAPE_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
 async def _scrape_async(prompts: list[str], platforms: list[str], headless: bool,
-                        progress, status, concurrency: int = 4) -> list[dict]:
+                        progress, status, concurrency: int | None = None) -> list[dict]:
     """Process prompts in parallel (up to `concurrency` prompts at once).
     Within each prompt, all platforms still run in parallel.
 
@@ -1665,6 +1695,8 @@ async def _scrape_async(prompts: list[str], platforms: list[str], headless: bool
     Perplexity, which each spin up their own context per prompt. RAM cost
     scales roughly linearly with `concurrency`.
     """
+    if concurrency is None:
+        concurrency = _default_concurrency()
     results: list[dict] = []
     total = len(prompts) * len(platforms)
     done_count = [0]
@@ -1966,6 +1998,17 @@ if _hero_expanded:
         csv = None
         text = "\n".join(_keywords)
 
+        # Repeated keywords are dropped by default so a scan never pays twice for
+        # the same query. That is wrong for load testing — pasting one keyword 500
+        # times would run a single scrape — so it can be turned off here.
+        _dupe_n = len(_keywords) - len(set(_keywords))
+        st.checkbox(
+            f"Keep duplicate keywords{f'  ({_dupe_n} repeat lines)' if _dupe_n else ''}",
+            key="allow_duplicate_keywords",
+            help="Off: repeats are collapsed to one scrape each (normal scans). "
+                 "On: every line is scraped, including repeats — for load testing.",
+        )
+
         # ---------- BLOCK 2 — Tracking Terms ----------
         st.markdown(
             "<div class='hero-block-gap'></div>"
@@ -2157,8 +2200,10 @@ if run_btn:
     elif not platforms:
         st.error("Pick at least one platform.")
     else:
+        _scan_t0 = time.monotonic()
         with st.spinner(f"Scanning {len(prompts)} keywords × {len(platforms)} platforms…"):
             rows_out = run_scrape(prompts, platforms, headless)
+        _scan_s = time.monotonic() - _scan_t0
         # Snapshot the input-source config + any metadata columns pulled
         # from the Sheet/Excel (Search Volume, Difficulty, etc.). Metadata
         # gets persisted with the run so Compare Reports can add columns
@@ -2187,6 +2232,27 @@ if run_btn:
         latest = list_runs(limit=1)
         if latest:
             st.session_state["pending_run_ts"] = latest[0]["ts"]
+        # Stash timing for the post-rerun view: st.rerun() below wipes anything
+        # written here, so the summary has to survive in session_state.
+        _by_plat: dict[str, list[float]] = {}
+        for _r in rows_out:
+            _by_plat.setdefault(_r.get("platform", "?"), []).append(
+                float(_r.get("duration_s") or 0.0)
+            )
+        st.session_state["last_scan_timing"] = {
+            "total_s": round(_scan_s, 1),
+            "rows": len(rows_out),
+            "prompts": len(prompts),
+            "platforms": {
+                p: {
+                    "n": len(v),
+                    "avg": round(sum(v) / len(v), 1) if v else 0.0,
+                    "max": round(max(v), 1) if v else 0.0,
+                    "total": round(sum(v), 1),
+                }
+                for p, v in sorted(_by_plat.items())
+            },
+        }
         st.success(f"Done. {len(rows_out)} responses captured.")
         st.rerun()
 
@@ -2214,6 +2280,46 @@ if results_df.empty:
         unsafe_allow_html=True,
     )
 else:
+    # ============================================================
+    # Scrape timing — how long the last scan took, overall and per platform.
+    # Shown once, right after a scan (survives the st.rerun via session_state).
+    # ============================================================
+    _timing = st.session_state.get("last_scan_timing")
+    if _timing:
+        def _dur(s: float) -> str:
+            s = float(s or 0)
+            if s < 60:
+                return f"{s:.1f}s"
+            m, sec = divmod(int(round(s)), 60)
+            return f"{m}m {sec:02d}s"
+
+        _plats = _timing.get("platforms") or {}
+        # Wall-clock beats the sum of per-scrape times because prompts run in
+        # parallel — say so, or the two numbers look contradictory.
+        _serial = sum(p["total"] for p in _plats.values())
+        with st.expander(
+            f"⏱  Last scan: {_dur(_timing['total_s'])} "
+            f"· {_timing['rows']} responses "
+            f"· {_timing['prompts']} keywords",
+            expanded=False,
+        ):
+            if _plats:
+                _cols = st.columns(len(_plats))
+                for _c, (_p, _st) in zip(_cols, _plats.items()):
+                    _c.metric(
+                        _p,
+                        _dur(_st["avg"]),
+                        help=(f"average per scrape · slowest {_dur(_st['max'])} "
+                              f"· {_st['n']} scrapes · {_dur(_st['total'])} total"),
+                    )
+            st.caption(
+                f"Wall clock {_dur(_timing['total_s'])} vs {_dur(_serial)} of "
+                f"combined scrape time — the gap is the parallelism "
+                f"(SCRAPE_CONCURRENCY, currently {_default_concurrency()} prompts "
+                f"at a time). Per-scrape times are in the results table's "
+                f"`duration_s` column."
+            )
+
     # ============================================================
     # Compute per-row tracking status & citation matrix
     # ============================================================

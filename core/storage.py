@@ -47,6 +47,8 @@ def init_db() -> None:
             c.execute("ALTER TABLE runs ADD COLUMN terms_source_config TEXT")
         if "keyword_metadata" not in cols:
             c.execute("ALTER TABLE runs ADD COLUMN keyword_metadata TEXT")
+        if "duration_s" not in cols:
+            c.execute("ALTER TABLE runs ADD COLUMN duration_s REAL DEFAULT 0")
 
 
 def _coerce_list_field(val) -> str:
@@ -77,8 +79,8 @@ def save_results(
             "INSERT INTO runs ("
             "ts, platform, prompt, response_text, citations, source_urls, "
             "fanout_queries, error, raw_html_path, terms_source_config, "
-            "keyword_metadata"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "keyword_metadata, duration_s"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     now,
@@ -92,6 +94,7 @@ def save_results(
                     r.get("raw_html_path", ""),
                     ts_cfg,
                     kw_meta,
+                    float(r.get("duration_s") or 0.0),
                 )
                 for r in results
             ],
@@ -101,7 +104,7 @@ def save_results(
 _SELECT_COLS = (
     "platform, prompt, response_text, citations, source_urls, "
     "fanout_queries, error, raw_html_path, ts, "
-    "terms_source_config, keyword_metadata"
+    "terms_source_config, keyword_metadata, duration_s"
 )
 
 
