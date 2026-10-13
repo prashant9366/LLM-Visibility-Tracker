@@ -36,6 +36,9 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
+import sqlite3
+import tempfile
 import time
 from urllib.parse import urlencode
 
@@ -99,6 +102,19 @@ COMPOSER_SELECTORS = (
 )
 COMPOSER_SEL = ", ".join(COMPOSER_SELECTORS)
 
+# The send control. Anonymous `?q=` auto-submits, so this was never needed --
+# SIGNED IN it is: chatgpt.com/?q=… drops the text into the composer and then
+# waits for a human to press send, so the prompt just sat there and RESP_SEL
+# never appeared. data-testid first (stable across builds), id second, the
+# aria-labels last because the wording changes.
+SEND_SELECTORS = (
+    "button[data-testid='send-button']",
+    "#composer-submit-button",
+    "button[aria-label='Send prompt']",
+    "button[aria-label='Send message']",
+    "form button[type='submit']",
+)
+
 DISMISS_SELECTORS = (
     "button:has-text('Stay logged out')",
     "button:has-text('Not now')",
@@ -122,7 +138,88 @@ _DEBUG_DIR = DATA_DIR / "debug"
 # browser. CHATGPT_POOL sets the width; 1 restores the old serial behaviour.
 # NOTE each slot clears Cloudflare Turnstile separately on its first load, so a
 # wider pool means more cold starts (see COLD_BUDGET_S and the warm-up note).
-POOL_SIZE = int(os.getenv("CHATGPT_POOL", "3"))
+POOL_WIDTH = int(os.getenv("CHATGPT_POOL", "3"))
+
+# Cookie names that mean "this profile is signed in".
+SESSION_COOKIE_NAMES = ("__Secure-next-auth.session-token",
+                        "__Session-session-token")
+# Default ON: when ANY pooled profile is signed in, use only the signed-in
+# ones. Signing in by hand covers the single window that happened to be open,
+# so the other slots stay anonymous -- and anonymous is the path Cloudflare
+# scrutinises hardest. Mixing them means a third of keywords silently take the
+# harder route and fail, which reads as "the login did nothing".
+# CHATGPT_SIGNED_IN_ONLY=0 restores the old behaviour (use every slot).
+SIGNED_IN_ONLY = (os.getenv("CHATGPT_SIGNED_IN_ONLY", "1").strip().lower()
+                  not in ("0", "false", "no", "off"))
+
+
+def _has_session_cookie(profile_name: str) -> bool:
+    """True when this profile dir holds a live ChatGPT login.
+
+    Chrome keeps cookies in a SQLite file it holds open, so it is copied to a
+    temp file and read there -- querying it in place fails with 'database is
+    locked' whenever a browser is running. Only cookie NAMES are read; the
+    values are encrypted and we never need them.
+    """
+    base = profile_dir(profile_name)
+    now_webkit = (time.time() + 11644473600) * 1_000_000
+    for rel in ("Default/Network/Cookies", "Default/Cookies", "Network/Cookies"):
+        src = base / rel
+        if not src.exists():
+            continue
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as fh:
+                tmp = fh.name
+            shutil.copyfile(src, tmp)
+            con = sqlite3.connect(tmp)
+            try:
+                marks = ",".join("?" * len(SESSION_COOKIE_NAMES))
+                row = con.execute(
+                    f"SELECT 1 FROM cookies WHERE name IN ({marks}) "
+                    "AND host_key LIKE '%chatgpt.com' "
+                    "AND (expires_utc = 0 OR expires_utc > ?) LIMIT 1",
+                    (*SESSION_COOKIE_NAMES, now_webkit)).fetchone()
+            finally:
+                con.close()
+            if row:
+                return True
+        except Exception:
+            continue
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    return False
+
+
+def _resolve_profiles() -> list[str]:
+    """Profile dirs this run will drive, in slot order."""
+    everything = [f"chatgpt_{i}" for i in range(POOL_WIDTH)]
+    if not SIGNED_IN_ONLY:
+        return everything
+    signed = [p for p in everything if _has_session_cookie(p)]
+    if not signed:
+        # Nothing is signed in — run anonymous across the full pool rather
+        # than refusing to work. That is the documented fallback, not an error.
+        print("[chatgpt] no signed-in profile found — running anonymous "
+              f"across {len(everything)} slot(s). "
+              "`python -m scrapers.login chatgpt` signs in all of them.")
+        return everything
+    if len(signed) < len(everything):
+        print(f"[chatgpt] using {len(signed)} signed-in profile(s) "
+              f"({', '.join(signed)}); {len(everything) - len(signed)} "
+              "anonymous slot(s) idle. Run `python -m scrapers.login chatgpt` "
+              "to sign in the rest.")
+    return signed
+
+
+# Slot N drives PROFILES[N] — NOT chatgpt_N. The two diverge as soon as only
+# some profiles are signed in, so every slot->dir lookup must go through here.
+PROFILES = _resolve_profiles()
+POOL_SIZE = len(PROFILES)
 _POOL = SlotPool(POOL_SIZE)
 
 # {slot: session}, each reused across keywords and bound to the loop that made it.
@@ -344,9 +441,8 @@ async def unlock_turnstile(timeout_s: int = 600) -> bool:
     each, and closes itself once the composer is reachable.
     """
     ok = True
-    for i in range(POOL_SIZE):
-        prof = f"chatgpt_{i}"
-        print(f"[chatgpt] warming profile {prof} ({i + 1}/{POOL_SIZE}) …")
+    for i, prof in enumerate(PROFILES):
+        print(f"[chatgpt] warming profile {prof} ({i + 1}/{len(PROFILES)}) …")
         try:
             got = await _unlock_one(prof, timeout_s)
         except Exception as e:
@@ -355,6 +451,97 @@ async def unlock_turnstile(timeout_s: int = 600) -> bool:
         print(f"[chatgpt] {prof}: {'cleared' if got else 'NOT cleared'}")
         ok = ok and got
     return ok
+
+
+async def _composer_text(page) -> str | None:
+    """Text sitting in the composer, or None when there is no composer."""
+    try:
+        comp = page.locator(COMPOSER_SEL).first
+        if not await comp.count():
+            return None
+        return (await comp.inner_text()) or ""
+    except Exception:
+        return None
+
+
+async def _wait_send_ready(page, timeout_ms: int = 20_000):
+    """Poll until a send button is visible AND enabled, then return it.
+
+    This is the "wait for the page to settle" step. ChatGPT mounts the
+    composer before the send button is wired up, and the button stays
+    `disabled` until the editor reports content -- clicking in that window
+    does nothing at all and looks exactly like a missing selector.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        for sel in SEND_SELECTORS:
+            try:
+                loc = page.locator(sel).first
+                if (await loc.count() and await loc.is_visible()
+                        and await loc.is_enabled()):
+                    return loc
+            except Exception:
+                continue
+        try:
+            await page.wait_for_timeout(250)
+        except Exception:
+            break
+    return None
+
+
+async def _ensure_submitted(page, prompt: str) -> bool:
+    """Make sure the prompt is actually SENT. True when we had to send it.
+
+    Covers both flows from one place:
+      * anonymous -- `?q=` auto-submits, the composer is already empty, and
+        this returns False without touching anything.
+      * signed in -- `?q=` only prefills. We wait for the composer to settle,
+        type the prompt if the prefill did not land at all, wait for the send
+        button to become enabled, then click it (Enter as the fallback).
+    """
+    text = await _composer_text(page)
+    if text is None:
+        return False            # no composer -- already in a conversation
+    if not text.strip():
+        # Either it auto-submitted (anonymous) or the prefill was ignored.
+        # An existing assistant turn tells those two apart.
+        try:
+            if await page.locator(RESP_SEL).count():
+                return False
+        except Exception:
+            return False
+        try:
+            await page.locator(COMPOSER_SEL).first.click(timeout=5_000)
+            # insert_text, not type(): ProseMirror handles a paste-style
+            # insert cleanly, and a long prompt typed key-by-key is slow
+            # enough that the send button can re-disable mid-way.
+            await page.keyboard.insert_text(prompt)
+        except Exception:
+            return False
+
+    btn = await _wait_send_ready(page)
+    if btn is not None:
+        try:
+            await btn.click(timeout=5_000)
+        except Exception:
+            btn = None
+    if btn is None:
+        # No usable button -- Enter still submits in the composer.
+        try:
+            await page.locator(COMPOSER_SEL).first.press("Enter", timeout=5_000)
+        except Exception:
+            return False
+
+    # Confirm it left the composer rather than assuming the click took.
+    for _ in range(20):
+        try:
+            await page.wait_for_timeout(250)
+        except Exception:
+            break
+        left = await _composer_text(page)
+        if left is None or not left.strip():
+            return True
+    return True
 
 
 _SKIP_HOSTS = ("openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com")
@@ -384,8 +571,10 @@ async def _ensure_session(slot: int = 0) -> dict:
         # Stale (loop changed or page died) — tear this slot down before relaunching.
         await _close_slot(slot)
 
-    # Each slot needs its OWN profile: one directory cannot back two live browsers.
-    user_dir = str(profile_dir(f"chatgpt_{slot}"))
+    # Each slot needs its OWN profile: one directory cannot back two live
+    # browsers. Indexed through PROFILES, which may hold only the signed-in
+    # dirs — so slot 1 is not necessarily chatgpt_1.
+    user_dir = str(profile_dir(PROFILES[slot % len(PROFILES)]))
     # A profile left "crashed" opens on the Restore-pages bubble and parks the
     # tab on about:blank — clear it before every launch, not just after a kill.
     sanitize_profile(user_dir)
@@ -582,6 +771,16 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                 if await _retry_verification(page):
                     await wait_quiet(page, idle_ms=250, net_idle=False)
 
+                # 1b. SEND it. Signed in, `?q=` prefills the composer and
+                #     stops there -- only the anonymous UI auto-submits. The
+                #     prompt was sitting unsent while we waited 60s for a
+                #     reply to a question nobody had asked yet.
+                if await _ensure_submitted(page, prompt):
+                    await wait_quiet(page, idle_ms=250, net_idle=False)
+                    # Verification fails on SUBMIT, so re-check after our click.
+                    if await _retry_verification(page):
+                        await wait_quiet(page, idle_ms=250, net_idle=False)
+
                 # 2. Wait for the assistant turn.
                 try:
                     await page.wait_for_selector(RESP_SEL, timeout=60_000)
@@ -595,11 +794,18 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                             (await page.inner_text("body"))[:4000])
                     except Exception:
                         stuck = None
-                    res.error = (
-                        "Cloudflare verification failed on submit (Retry did not "
-                        "clear it). Anonymous sessions get the strictest check -- "
-                        "run `python -m scrapers.login chatgpt`."
-                        if stuck else "Assistant response never appeared.")
+                    if stuck:
+                        res.error = (
+                            "Cloudflare verification failed on submit (Retry did "
+                            "not clear it)."
+                            if SIGNED_IN_ONLY and _has_session_cookie(
+                                PROFILES[slot % len(PROFILES)])
+                            else "Cloudflare verification failed on submit "
+                                 "(Retry did not clear it). This profile is "
+                                 "ANONYMOUS, which gets the strictest check -- "
+                                 "run `python -m scrapers.login chatgpt`.")
+                    else:
+                        res.error = "Assistant response never appeared."
                     return res
 
                 await wait_for_stable_text(
