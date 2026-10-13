@@ -15,6 +15,10 @@ _test_*.json
 # proxy list (infrastructure, not for the repo)
 proxies.txt
 
-# secrets — never commit
-# .env
-# .env.*
+# secrets -- never commit. The rule must be ACTIVE, not a
+# comment: .env holds PROXY_USER / PROXY_PASS and was tracked
+# in this repo until 13 Oct 2026.
+.env
+.env.*
+!.env.example
+logs/

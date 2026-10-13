@@ -6,6 +6,12 @@ Submits a list of prompts to ChatGPT, Claude, Gemini, and Perplexity, scrapes th
 
 Scraping the chat UIs of ChatGPT, Claude, and Gemini **violates their Terms of Service** and can get your account banned. Perplexity public search URLs are publicly accessible but still ToS-restricted for automation. Run this against test accounts you are willing to lose. The official APIs (OpenAI / Anthropic / Gemini / Perplexity Sonar) all return citations as structured data and would be the compliant path — see `core/api_alternative.md`.
 
+## Deploying on a server
+
+For Windows Server -- service setup, proxies, firewall, headless
+browser gotchas -- see **[DEPLOY-WINDOWS.md](DEPLOY-WINDOWS.md)**.
+The steps below are for a local development machine.
+
 ## Install
 
 ```powershell
@@ -18,9 +24,25 @@ python -m playwright install chromium
 
 ## Login
 
-None of the three supported platforms (ChatGPT, Perplexity, Gemini) require login. Gemini's anonymous mode renders only at `gemini.google.com/app?hl=en-IN` and below — the locale parameter unlocks the guest composer. In anonymous Gemini, the inline citation chips don't expose source URLs as plain anchors, so you'll see Gemini responses with `citation_count = 0` even when the model used grounding. ChatGPT and Perplexity both expose real source URLs.
+Log in once per platform. A real browser window opens, you sign in, and the cookies are written to `data/profiles/<platform>/` for every later run to reuse:
+
+```powershell
+python -m scrapers.login perplexity
+python -m scrapers.login chatgpt
+python -m scrapers.login gemini
+```
+
+**Perplexity requires it.** Anonymous search is gated — logged out it answers "Sign up and repeat your request" and returns no citations at all. Being signed in also restores the source links.
+
+Perplexity's login goes through Camoufox (Firefox) rather than Chrome, because its scraper uses Scrapling's StealthyFetcher to clear Cloudflare and a Chromium profile's cookies are unreadable to it. That is what `scrapling install` provides.
+
+Re-run the login for a platform whenever a scraper reports a sign-up wall; sessions expire and nothing recovers that on its own.
+
+Gemini's anonymous mode renders only at `gemini.google.com/app?hl=en-IN` and below — the locale parameter unlocks the guest composer. In anonymous Gemini, the inline citation chips don't expose source URLs as plain anchors, so you'll see Gemini responses with `citation_count = 0` even when the model used grounding.
 
 Claude was dropped because claude.ai has no anonymous mode.
+
+⚠ Automating a signed-in account violates these platforms' Terms of Service. Use accounts you are willing to lose.
 
 ## Run
 
@@ -41,10 +63,9 @@ Paste prompts (one per line) or upload a CSV with a `prompt` column, pick the pl
 app.py                Streamlit UI
 scrapers/
   base.py             ScrapeResult dataclass, common helpers
-  perplexity.py       Public search URL (no login)
-  chatgpt.py          chatgpt.com (login required)
-  claude.py           claude.ai (login required)
-  gemini.py           gemini.google.com (login required)
+  perplexity.py       Camoufox/Scrapling on a logged-in profile
+  chatgpt.py          chatgpt.com (login required, always headed)
+  gemini.py           gemini.google.com (login required, headless OK)
   login.py            One-shot interactive login helper
 core/
   aggregator.py       Domain extraction + counting

@@ -1,7 +1,18 @@
-scrapling[fetchers]>=0.2.9
+# Core app
 streamlit>=1.36
 pandas>=2.2
 plotly>=5.22
 tldextract>=5.1
+requests>=2.31
+openpyxl>=3.1            # Excel export in core/export.py
+
+# Browser automation. Chrome is driven through a persistent profile, so the
+# machine needs a real Chrome install as well -- see the README.
 playwright>=1.44
 playwright-stealth>=2.0
+scrapling[fetchers]>=0.2.9
+
+# Optional, and tried FIRST by scrapers/_browser.py: a patched Playwright
+# that is harder to fingerprint. The code falls back to plain playwright
+# when it is absent, so you can drop this line if the install gives trouble.
+patchright>=1.44
