@@ -62,9 +62,19 @@ from ._browser import (
 try:
     from patchright.async_api import async_playwright as async_patchright  # type: ignore
     _HAS_PATCHRIGHT = True
-except Exception:  # pragma: no cover
+except Exception as _e:  # pragma: no cover
     from playwright.async_api import async_playwright as async_patchright  # type: ignore
     _HAS_PATCHRIGHT = False
+    # Said out loud, because the fallback is silent and expensive. Vanilla
+    # Playwright launches Chrome with --disable-blink-features=Automation-
+    # Controlled among its defaults, which raises Chrome's yellow
+    # "unsupported command-line flag" infobar -- visible proof to anyone
+    # looking, and an automation tell Turnstile reads. If that banner is on
+    # screen, this branch is why.
+    print("[chatgpt] patchright NOT available "
+          f"({type(_e).__name__}) — falling back to vanilla Playwright, "
+          "which Cloudflare fingerprints. Fix with:\n"
+          "    pip install patchright && python -m patchright install chrome")
 
 
 # The answer container in current ChatGPT is `.markdown` (the rendered
