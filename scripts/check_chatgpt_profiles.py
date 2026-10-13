@@ -35,7 +35,8 @@ def cookies_for(name: str) -> tuple[str | None, list[tuple[str, str, int]]]:
         src = base / rel
         if not src.exists():
             continue
-        tmp = None
+        tmp = None 
+
         try:
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as fh:
                 tmp = fh.name
