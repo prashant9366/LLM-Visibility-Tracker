@@ -52,7 +52,6 @@ from .base import ScrapeResult, DATA_DIR, profile_dir
 from ._browser import (
     persistent_context,
     wait_quiet,
-    wait_for_stable_text,
     make_response_capturer,
     dedupe,
     release_profile,
@@ -99,6 +98,99 @@ RESP_SELECTORS = (
     "article .markdown",
 )
 RESP_SEL = ", ".join(RESP_SELECTORS)
+
+# Selectors that identify an assistant TURN (a whole message), tried in order.
+# Checked before the generic list because `.markdown` also matches fragments
+# nested inside a rich answer -- the product cards in a shopping reply each
+# carry their own block.
+ANSWER_CONTAINERS = (
+    "[data-message-author-role='assistant']",
+    "[data-message-role='assistant']",
+    "[data-assistant-markdown]",
+    "[data-testid^='conversation-turn']:last-of-type .markdown",
+)
+
+# Pick the answer in ONE synchronous page call.
+#
+# Replaces `page.locator(RESP_SEL).last`, which was the bug behind "it is on
+# screen but nothing is fetched": `.last` is the last node matching ANY of the
+# six selectors in DOM order, and in a rich answer that is a trailing fragment
+# -- one card's block -- not the message. The scrape then stored a few words,
+# or nothing, while a complete answer sat in the window.
+#
+# Done in JS rather than via locators because ChatGPT re-renders the markdown
+# subtree on every streamed token: an element handle resolved on the Python
+# side keeps detaching mid-call.
+_PICK_ANSWER_JS = """
+(sels) => {
+  const textOf = (n) => ((n && n.innerText) || '').trim();
+  // 1. A real assistant turn, newest first.
+  for (const s of sels.containers) {
+    let m;
+    try { m = document.querySelectorAll(s); } catch (e) { continue; }
+    if (m.length) {
+      const t = textOf(m[m.length - 1]);
+      if (t) return t;
+    }
+  }
+  // 2. Otherwise the LONGEST block any selector matches. Length is the
+  //    tie-break that makes this robust to the class names rotating:
+  //    the answer is always the biggest thing on the page.
+  let best = '';
+  for (const s of sels.any) {
+    let m;
+    try { m = document.querySelectorAll(s); } catch (e) { continue; }
+    for (const n of m) {
+      const t = textOf(n);
+      if (t.length > best.length) best = t;
+    }
+  }
+  return best;
+}
+"""
+
+
+async def _answer_text(page) -> str:
+    """The assistant's answer, or '' when it is not on the page yet."""
+    try:
+        return (await page.evaluate(
+            _PICK_ANSWER_JS,
+            {"containers": list(ANSWER_CONTAINERS),
+             "any": list(RESP_SELECTORS)})) or ""
+    except Exception:
+        return ""
+
+
+async def _wait_answer_stable(page, *, idle_ms: int = 1400,
+                              max_ms: int = 180_000,
+                              poll_ms: int = 350,
+                              min_chars: int = 80) -> str:
+    """Poll until the answer stops growing for `idle_ms`. Returns the text.
+
+    chatgpt-local rather than _browser.wait_for_stable_text because that
+    helper measures `locator(sel).last` -- the same wrong element. Measuring
+    one node and then reading another is how a 180s wait could expire on a
+    fragment that never reached min_chars while the real answer sat finished
+    beside it.
+    """
+    deadline = time.monotonic() + max_ms / 1000
+    text = ""
+    last_len = -1
+    last_change = time.monotonic()
+    while time.monotonic() < deadline:
+        cur = await _answer_text(page)
+        if cur:
+            text = cur
+        if len(cur) != last_len:
+            last_len = len(cur)
+            last_change = time.monotonic()
+        elif last_len >= min_chars and (time.monotonic() - last_change) * 1000 >= idle_ms:
+            return text
+        try:
+            await page.wait_for_timeout(poll_ms)
+        except Exception:
+            break
+    return text
 
 # ChatGPT's anonymous flow has TWO elements sharing id="prompt-textarea":
 #   1. <textarea id="prompt-textarea" style="display:none">  — hidden fallback
@@ -774,11 +866,27 @@ async def close_session() -> None:
 # stall); every load after it rides the cf_clearance cookie and takes ~8-12s.
 _WARMED = False
 
-# Hard ceilings. A cold profile must clear Turnstile and can stall in a way that
-# ignores page.goto's own timeout (measured: a 150s wait_for overran to 445s), so
-# the whole scrape is bounded here rather than trusting the inner timeouts.
-COLD_BUDGET_S = 100
-WARM_BUDGET_S = 90
+# How long the ANSWER itself may take to finish streaming. A prompt that makes
+# ChatGPT run a web search spends 20-60s searching before a single character
+# appears, then streams a long reply -- so this is minutes, not seconds.
+ANSWER_MAX_S = int(os.getenv("CHATGPT_ANSWER_MAX_S", "180"))
+# How long to wait for the assistant turn to APPEAR at all. Separate from the
+# streaming budget above: with a web search this is the long silent gap while
+# ChatGPT searches, before any text exists to be stable.
+FIRST_TOKEN_S = int(os.getenv("CHATGPT_FIRST_TOKEN_S", "90"))
+
+# Hard ceilings for the WHOLE scrape. A cold profile must clear Turnstile and
+# can stall in a way that ignores page.goto's own timeout (measured: a 150s
+# wait_for overran to 445s), so the scrape is bounded here rather than trusting
+# the inner timeouts.
+#
+# These MUST stay larger than ANSWER_MAX_S plus the navigation and submit
+# steps. They were 100/90 against a 180s answer wait, so the outer timeout
+# always fired first: the browser sat on a complete, correct answer while the
+# scrape was killed at 90s and reported "timed out" — which looks exactly like
+# a broken selector and is not one.
+COLD_BUDGET_S = int(os.getenv("CHATGPT_COLD_BUDGET_S", str(ANSWER_MAX_S + 120)))
+WARM_BUDGET_S = int(os.getenv("CHATGPT_WARM_BUDGET_S", str(ANSWER_MAX_S + 90)))
 
 
 async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
@@ -892,7 +1000,8 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
 
                 # 2. Wait for the assistant turn.
                 try:
-                    await page.wait_for_selector(RESP_SEL, timeout=60_000)
+                    await page.wait_for_selector(RESP_SEL,
+                                                 timeout=FIRST_TOKEN_S * 1000)
                 except Exception:
                     await _dump_failure(page, "response")
                     # Name the real cause when it is still on screen. "Assistant
@@ -928,8 +1037,9 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                         res.error = "Assistant response never appeared."
                     return res
 
-                await wait_for_stable_text(
-                    page, RESP_SEL, idle_ms=1400, max_ms=180_000, min_chars=80
+                stable_text = await _wait_answer_stable(
+                    page, idle_ms=1400, max_ms=ANSWER_MAX_S * 1000,
+                    min_chars=80,
                 )
 
                 # Wait for the citation chips to attach. The old
@@ -945,23 +1055,18 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                     pass
 
                 # ---- DOM extraction ----
-                # Read via `evaluate("e => e.innerText")`, NOT `inner_text()`.
-                # ChatGPT's `markdown-new-styling` renderer re-renders the
-                # `.markdown` subtree on every streamed token, so the element
-                # handle `inner_text()` resolves keeps detaching mid-call and
-                # the actionability retry loop times out (returning empty text
-                # while citations still populate). A one-shot synchronous
-                # innerText read grabs whatever node matches at that instant —
-                # the same trick `wait_for_stable_text` already relies on.
-                last_msg = page.locator(RESP_SEL).last
-                try:
-                    txt = (await last_msg.evaluate("e => e.innerText || ''")).strip()
-                    if txt:
-                        res.response_text = txt[:50000]
-                except Exception:
-                    pass
+                # Same picker the stability wait used, so what we measured is
+                # what we read. Re-run rather than trusting `stable_text`: the
+                # citation wait above can attach chips that add text.
+                txt = (await _answer_text(page)) or stable_text
+                if txt:
+                    res.response_text = txt.strip()[:50000]
 
                 if not res.response_text:
+                    # Everything matched nothing. Keep the page for inspection
+                    # instead of reporting an empty answer with no evidence —
+                    # this is the case where the selectors really have drifted.
+                    await _dump_failure(page, "empty")
                     for sel in RESP_SELECTORS:
                         try:
                             loc = page.locator(sel).last
