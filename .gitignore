@@ -1,24 +1,23 @@
-.venv/
-venv/
-__pycache__/
-*.pyc
-data/results.db
+# .venv/
+# venv/
+# __pycache__/
+# *.pyc
+# data/results.db
 data/profiles/
 data/debug/
-.streamlit/
-.DS_Store
-debug.log
-_test_*.py
-_test_*.log
-_test_*.json
+# .streamlit/
+# .DS_Store
+# debug.log
+# _test_*.py
+# _test_*.log
+# _test_*.json
 
 # proxy list (infrastructure, not for the repo)
-proxies.txt
+# proxies.txt
 
-# secrets -- never commit. The rule must be ACTIVE, not a
-# comment: .env holds PROXY_USER / PROXY_PASS and was tracked
-# in this repo until 13 Oct 2026.
-.env
-.env.*
-!.env.example
-logs/
+# secrets — never commit
+# .env
+# .env.*
+```bash
+python -m ai_award.cli login --cdp
+```
