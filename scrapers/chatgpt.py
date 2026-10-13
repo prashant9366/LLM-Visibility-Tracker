@@ -64,22 +64,41 @@ from ._browser import (
     SlotPool,
 )
 
+# Which driver launches the browser.
+#   patchright  (default) — patched Chromium driver, real Chrome
+#   playwright            — plain Playwright, still real Chrome. The "simple
+#                           browser": no patching, nothing clever.
+#   chromium              — plain Playwright on its own bundled Chromium.
+#                           NOTE this can lose the login: recent Chrome
+#                           encrypts cookie values with a key bound to the
+#                           Chrome executable, which bundled Chromium cannot
+#                           decrypt. Expect to sign in again if you use it.
+CHATGPT_ENGINE = (os.getenv("CHATGPT_ENGINE", "patchright").strip().lower()
+                  or "patchright")
+
 try:
+    if CHATGPT_ENGINE != "patchright":
+        raise ImportError(f"CHATGPT_ENGINE={CHATGPT_ENGINE}")
     from patchright.async_api import async_playwright as async_patchright  # type: ignore
     _HAS_PATCHRIGHT = True
 except Exception as _e:  # pragma: no cover
     from playwright.async_api import async_playwright as async_patchright  # type: ignore
     _HAS_PATCHRIGHT = False
-    # Said out loud, because the fallback is silent and expensive. Vanilla
+    # Said out loud, because the fallback is otherwise silent. Vanilla
     # Playwright launches Chrome with --disable-blink-features=Automation-
     # Controlled among its defaults, which raises Chrome's yellow
     # "unsupported command-line flag" infobar -- visible proof to anyone
-    # looking, and an automation tell Turnstile reads. If that banner is on
-    # screen, this branch is why.
-    print("[chatgpt] patchright NOT available "
-          f"({type(_e).__name__}) — falling back to vanilla Playwright, "
-          "which Cloudflare fingerprints. Fix with:\n"
-          "    pip install patchright && python -m patchright install chrome")
+    # looking, and an automation tell. If that banner is on screen, this
+    # branch is why.
+    if CHATGPT_ENGINE == "patchright":
+        print("[chatgpt] patchright NOT available "
+              f"({type(_e).__name__}) — falling back to vanilla Playwright, "
+              "which Cloudflare fingerprints. Fix with:\n"
+              "    pip install patchright && python -m patchright install chrome")
+    else:
+        print(f"[chatgpt] engine: {CHATGPT_ENGINE} (plain Playwright"
+              + (", bundled Chromium)" if CHATGPT_ENGINE == "chromium"
+                 else ", real Chrome)"))
 
 
 # The answer container in current ChatGPT is `.markdown` (the rendered
@@ -148,6 +167,63 @@ _PICK_ANSWER_JS = """
   return best;
 }
 """
+
+
+# ChatGPT's own render failure: the turn exists, the action row is there, but
+# the body says "This response couldn't load" (usually under a "Worked for Ns"
+# line). The backend produced something the client could not show, so there is
+# no answer to extract and waiting changes nothing -- the fix is to press
+# regenerate, which re-requests the same prompt in the same thread.
+_RESPONSE_FAILED_RE = re.compile(
+    r"this response (?:couldn'?t|could not|didn'?t|did not) load", re.I)
+
+REGENERATE_SELECTORS = (
+    "button[data-testid='regenerate-thread-button']",
+    "button[aria-label='Retry']",
+    "button[aria-label='Regenerate']",
+    "button[aria-label='Try again']",
+    "button:has-text('Regenerate')",
+    "button:has-text('Try again')",
+)
+
+
+async def _regenerate_if_failed(page, *, attempts: int = 2) -> bool:
+    """Press regenerate while the answer says it could not load.
+
+    Returns True if a retry was issued (so the caller re-waits), False when
+    there was nothing wrong or nothing to click.
+    """
+    issued = False
+    for _ in range(attempts):
+        try:
+            body = (await page.inner_text("body"))[:6000]
+        except Exception:
+            return issued
+        if not _RESPONSE_FAILED_RE.search(body):
+            return issued
+        clicked = False
+        for sel in REGENERATE_SELECTORS:
+            try:
+                loc = page.locator(sel).last
+                if await loc.count() and await loc.is_visible():
+                    await loc.click(timeout=5_000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            print("[chatgpt] response failed to load and no regenerate button "
+                  "was found")
+            return issued
+        issued = True
+        print("[chatgpt] response failed to load — regenerating")
+        try:
+            await page.wait_for_timeout(2_000)
+        except Exception:
+            break
+        await _wait_answer_stable(
+            page, idle_ms=1400, max_ms=ANSWER_MAX_S * 1000, min_chars=80)
+    return issued
 
 
 async def _answer_text(page) -> str:
@@ -790,7 +866,10 @@ async def _ensure_session(slot: int = 0) -> dict:
         # survived the first fix.
         chromium_sandbox=True,
     )
-    if _HAS_PATCHRIGHT:
+    # Real Chrome unless explicitly asked for bundled Chromium. Keeping the
+    # channel is what preserves the signed-in profile: the cookie encryption
+    # key in recent Chrome is bound to the Chrome executable.
+    if CHATGPT_ENGINE != "chromium":
         kwargs["channel"] = "chrome"
         kwargs["no_viewport"] = False
     try:
@@ -1042,6 +1121,12 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                     min_chars=80,
                 )
 
+                # ChatGPT may render the turn but fail to load its content
+                # ("This response couldn't load"). Waiting longer never fixes
+                # that -- regenerate is the only thing that does.
+                if await _regenerate_if_failed(page):
+                    stable_text = await _answer_text(page) or stable_text
+
                 # Wait for the citation chips to attach. The old
                 # [data-testid="webpage-citation-pill"] hook no longer exists in the
                 # anonymous UI, so it could only ever burn its full timeout — every
@@ -1059,6 +1144,15 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                 # what we read. Re-run rather than trusting `stable_text`: the
                 # citation wait above can attach chips that add text.
                 txt = (await _answer_text(page)) or stable_text
+                if txt and _RESPONSE_FAILED_RE.search(txt[:400]):
+                    # Don't store ChatGPT's failure notice as the answer --
+                    # it would look like a real (and very wrong) result in
+                    # the report.
+                    await _dump_failure(page, "response-failed")
+                    res.error = ("ChatGPT rendered the turn but its content "
+                                 "failed to load, and regenerating did not "
+                                 "fix it.")
+                    return res
                 if txt:
                     res.response_text = txt.strip()[:50000]
 
