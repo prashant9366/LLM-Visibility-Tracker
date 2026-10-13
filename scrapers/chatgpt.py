@@ -489,15 +489,37 @@ async def _wait_send_ready(page, timeout_ms: int = 20_000):
     return None
 
 
+async def _sent(page, timeout_ms: int = 6_000) -> bool:
+    """True once the composer has emptied, i.e. the prompt really went.
+
+    Checked rather than assumed: a click that lands on a disabled or
+    overlaid button raises nothing and leaves the text sitting there, which
+    is exactly the stall this function exists to detect.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            await page.wait_for_timeout(250)
+        except Exception:
+            return False
+        left = await _composer_text(page)
+        if left is None or not left.strip():
+            return True
+    return False
+
+
 async def _ensure_submitted(page, prompt: str) -> bool:
     """Make sure the prompt is actually SENT. True when we had to send it.
 
     Covers both flows from one place:
       * anonymous -- `?q=` auto-submits, the composer is already empty, and
         this returns False without touching anything.
-      * signed in -- `?q=` only prefills. We wait for the composer to settle,
-        type the prompt if the prefill did not land at all, wait for the send
-        button to become enabled, then click it (Enter as the fallback).
+      * signed in -- `?q=` only PREFILLS and waits for a human.
+
+    ENTER is the primary action, the send button only a fallback. Enter goes
+    through the composer's own key handler, which is the same path a person
+    takes; clicking the button depends on hitting the right element while it
+    is enabled and unobscured, and that is what was silently doing nothing.
     """
     text = await _composer_text(page)
     if text is None:
@@ -514,34 +536,49 @@ async def _ensure_submitted(page, prompt: str) -> bool:
             await page.locator(COMPOSER_SEL).first.click(timeout=5_000)
             # insert_text, not type(): ProseMirror handles a paste-style
             # insert cleanly, and a long prompt typed key-by-key is slow
-            # enough that the send button can re-disable mid-way.
+            # enough that the send control can re-disable mid-way.
             await page.keyboard.insert_text(prompt)
         except Exception:
             return False
 
-    btn = await _wait_send_ready(page)
+    # Settle first. The send button going enabled is the signal that the
+    # editor has registered its content and the composer is wired up --
+    # pressing Enter before that is swallowed.
+    await _wait_send_ready(page)
+
+    composer = page.locator(COMPOSER_SEL).first
+
+    # 1. Enter, from the composer itself.
+    try:
+        await composer.click(timeout=5_000)
+        await composer.press("Enter", timeout=5_000)
+        if await _sent(page):
+            return True
+    except Exception:
+        pass
+
+    # 2. Enter again at the keyboard level, in case the click moved focus.
+    try:
+        await composer.focus(timeout=3_000)
+        await page.keyboard.press("Enter")
+        if await _sent(page):
+            return True
+    except Exception:
+        pass
+
+    # 3. Last resort: the send button.
+    btn = await _wait_send_ready(page, timeout_ms=5_000)
     if btn is not None:
         try:
             await btn.click(timeout=5_000)
+            if await _sent(page):
+                return True
         except Exception:
-            btn = None
-    if btn is None:
-        # No usable button -- Enter still submits in the composer.
-        try:
-            await page.locator(COMPOSER_SEL).first.press("Enter", timeout=5_000)
-        except Exception:
-            return False
+            pass
 
-    # Confirm it left the composer rather than assuming the click took.
-    for _ in range(20):
-        try:
-            await page.wait_for_timeout(250)
-        except Exception:
-            break
-        left = await _composer_text(page)
-        if left is None or not left.strip():
-            return True
-    return True
+    print("[chatgpt] prompt is still sitting in the composer — Enter and the "
+          "send button both failed to submit it")
+    return False
 
 
 _SKIP_HOSTS = ("openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com")
@@ -794,6 +831,17 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                             (await page.inner_text("body"))[:4000])
                     except Exception:
                         stuck = None
+                    # Still in the composer? Then nothing was ever asked, and
+                    # "no response" is a misleading way to say so.
+                    try:
+                        unsent = (await _composer_text(page) or "").strip()
+                    except Exception:
+                        unsent = ""
+                    if unsent and not stuck:
+                        res.error = ("Prompt was never submitted — it is still "
+                                     "sitting in the composer (Enter and the "
+                                     "send button both did nothing).")
+                        return res
                     if stuck:
                         res.error = (
                             "Cloudflare verification failed on submit (Retry did "
