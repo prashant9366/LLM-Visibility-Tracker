@@ -154,9 +154,14 @@ _DEBUG_DIR = DATA_DIR / "debug"
 # wider pool means more cold starts (see COLD_BUDGET_S and the warm-up note).
 POOL_WIDTH = int(os.getenv("CHATGPT_POOL", "3"))
 
-# Cookie names that mean "this profile is signed in".
+# Cookie names that mean "this profile is signed in". Matched by PATTERN as
+# well as by exact name: OpenAI has renamed this cookie more than once, and a
+# stale list here reads as "you are not logged in" however many times you log
+# in. Anonymous profiles carry oai-did / oai-sc / _cfuvid and none of these.
 SESSION_COOKIE_NAMES = ("__Secure-next-auth.session-token",
-                        "__Session-session-token")
+                        "__Session-session-token",
+                        "__Secure-authjs.session-token")
+SESSION_COOKIE_PATTERNS = ("%session-token%", "%next-auth%", "%authjs%")
 # Default ON: when ANY pooled profile is signed in, use only the signed-in
 # ones. Signing in by hand covers the single window that happened to be open,
 # so the other slots stay anonymous -- and anonymous is the path Cloudflare
@@ -189,11 +194,13 @@ def _has_session_cookie(profile_name: str) -> bool:
             con = sqlite3.connect(tmp)
             try:
                 marks = ",".join("?" * len(SESSION_COOKIE_NAMES))
+                likes = " OR ".join(["name LIKE ?"] * len(SESSION_COOKIE_PATTERNS))
                 row = con.execute(
-                    f"SELECT 1 FROM cookies WHERE name IN ({marks}) "
+                    f"SELECT 1 FROM cookies WHERE (name IN ({marks}) OR {likes}) "
                     "AND host_key LIKE '%chatgpt.com' "
                     "AND (expires_utc = 0 OR expires_utc > ?) LIMIT 1",
-                    (*SESSION_COOKIE_NAMES, now_webkit)).fetchone()
+                    (*SESSION_COOKIE_NAMES, *SESSION_COOKIE_PATTERNS,
+                     now_webkit)).fetchone()
             finally:
                 con.close()
             if row:
