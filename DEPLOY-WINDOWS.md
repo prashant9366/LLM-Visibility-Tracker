@@ -127,10 +127,10 @@ errors.
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+streamlit run app.py --server.address 0.0.0.0 --server.port 8000
 ```
 
-Open `http://localhost:8501` **on the server itself** first. Once the
+Open `http://localhost:8000` **on the server itself** first. Once the
 logins in section 7 are done, paste one prompt, pick Gemini (headless, so
 it works in any session), and run it. A row with a response back means
 the browser stack works.
@@ -139,13 +139,13 @@ Then open the firewall and try from another machine:
 
 ```powershell
 New-NetFirewallRule -DisplayName "LLM Visibility Tracker" `
-  -Direction Inbound -Protocol TCP -LocalPort 8501 -Action Allow
+  -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
 ```
 
 `--server.address 0.0.0.0` is what makes it listen on anything but
 localhost. Without it the firewall rule changes nothing.
 
-> Streamlit has no authentication. Port 8501 open to the internet means
+> Streamlit has no authentication. Port 8000 open to the internet means
 > anyone can run scrapes on your proxies. Keep the rule scoped to your
 > office range (`-RemoteAddress`), or put it behind a reverse proxy that
 > does auth.
@@ -193,7 +193,7 @@ Logs land in `logs\streamlit.log`.
 ```powershell
 nssm install LLMTracker `
   "C:\Users\Administrator\Desktop\LLM-Visibility-Tracker\.venv\Scripts\streamlit.exe" `
-  "run app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true"
+  "run app.py --server.address 0.0.0.0 --server.port 8000 --server.headless true"
 nssm set LLMTracker AppDirectory "C:\Users\Administrator\Desktop\LLM-Visibility-Tracker"
 nssm set LLMTracker AppStdout    "C:\Users\Administrator\Desktop\LLM-Visibility-Tracker\logs\streamlit.log"
 nssm set LLMTracker AppStderr    "C:\Users\Administrator\Desktop\LLM-Visibility-Tracker\logs\streamlit.log"

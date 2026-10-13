@@ -1,7 +1,7 @@
 """Login gate for the Streamlit app.
 
 Streamlit ships no authentication, and the app drives a pool of paid proxies
-and signed-in LLM accounts -- so anyone who can reach port 8501 can spend
+and signed-in LLM accounts -- so anyone who can reach port 8000 can spend
 your credits and burn your sessions. This is the gate in front of that.
 
 What it is NOT: this is a shared-team door lock, not an identity system.
@@ -20,7 +20,7 @@ token, recorded server-side in data/sessions.json and carried in the URL as
     unlocked machine) is signed in as that person until it expires. That is
     the trade for not adding a cookie-component dependency, and it is
     acceptable only because this sits on an internal port behind a firewall
-    rule. Do not expose 8501 publicly on the strength of this gate.
+    rule. Do not expose 8000 publicly on the strength of this gate.
 
 Sessions idle out after SESSION_TTL_HOURS. Because every page render
 touches `last_seen`, the same records answer "who is using this right now"

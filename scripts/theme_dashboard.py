@@ -62,7 +62,7 @@ TITLE_OLD = "CashKaro · AI Citation Tracker"
 TITLE_NEW = "Citerion · LLM Tracker"
 
 # ── Cross-link to the live Streamlit dashboard (companion to scripts/dashboard.py) ──
-LIVE_URL = "http://localhost:8501"          # Streamlit default; edit if you change the port
+LIVE_URL = "http://localhost:8000"          # matches run_tracker.bat / DEPLOY-WINDOWS.md
 LIVE_LINK_MARKER = ">Live dashboard<"        # present iff the link was already inserted
 SIDEBAR_ASSET_MARKER = 'className="side-foot"'  # identifies the sidebar JSX module
 

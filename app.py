@@ -88,7 +88,7 @@ st.set_page_config(
 # Login gate. Must come before anything else renders: require_login calls
 # st.stop() when nobody is signed in, and anything drawn above it would be
 # visible to a stranger. The app drives paid proxies and signed-in LLM
-# accounts, so an open port 8501 is someone else spending your credits.
+# accounts, so an open port 8000 is someone else spending your credits.
 _user = require_login(st)
 
 # Kill the sidebar entirely — the tool nav moved to the top bar, and the

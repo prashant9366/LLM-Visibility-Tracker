@@ -13,7 +13,7 @@ rem The venv's streamlit.exe directly, not "python -m streamlit": the task
 rem runs without a shell, so nothing has activated the venv for us.
 ".venv\Scripts\streamlit.exe" run app.py ^
   --server.address 0.0.0.0 ^
-  --server.port 8501 ^
+  --server.port 8000 ^
   --server.headless true ^
   >> logs\streamlit.log 2>&1
 

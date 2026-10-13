@@ -1,0 +1,6 @@
+# Streamlit's own config. Kept so the port is 8000 even when someone runs a
+# bare `streamlit run app.py` with no flags -- run_tracker.bat and the NSSM
+# service pass --server.port explicitly, but a person debugging on the server
+# usually will not, and landing on two different ports is confusing.
+[server]
+port = 8000
