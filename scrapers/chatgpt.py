@@ -1,9 +1,16 @@
-"""ChatGPT (anonymous chatgpt.com) with network interception.
+"""ChatGPT (chatgpt.com) with network interception.
 
-Driven via URL-prefill at the user's explicit request (2026-05-29): navigate
-directly to `https://chatgpt.com/?q=<urlencoded prompt>` so ChatGPT
-auto-submits the prompt without us needing to find/click/type into the
-ProseMirror composer (which keeps redesigning and breaking selector chains).
+Driven by TYPING into the composer and pressing Enter (2026-10-13, at the
+user's request). Each keyword loads plain `https://chatgpt.com/` — which also
+guarantees a fresh conversation, so keywords never pile into one thread — then
+the prompt is typed in and sent with Enter.
+
+This replaced the `?q=<urlencoded prompt>` prefill URL used since 2026-05-29.
+That worked only while the scraper ran anonymous: ChatGPT auto-submits a `q`
+param for a signed-out visitor, but once SIGNED IN it merely fills the
+composer and waits for a human. The prompt sat there unsent while the scrape
+waited out its 60s response timeout and reported "Assistant response never
+appeared". Typing + Enter behaves identically on both.
 
 Always runs headed via patchright + real Chrome (the only combo that
 auto-passes Cloudflare Turnstile on residential IPs). The `headless`
@@ -13,7 +20,7 @@ Persistent session — like the Google AIO scraper (2026-06-03): DO NOT open
 and close Chrome per keyword. One headed Chrome (patchright + real Chrome) is
 launched once via `_ensure_session`, lands on chatgpt.com, clears Cloudflare
 Turnstile a single time, and is then reused for every prompt in a batch —
-each new keyword navigates the SAME open tab to the `?q=` prefill URL (the
+each new keyword reloads chatgpt.com in the SAME open tab (the
 cf_clearance cookie from the first load means Turnstile no longer re-fires).
 `close_session()` tears it down once the whole scan finishes (called from the
 app's run handler). Relaunching Chrome per keyword was slow and flashed a new
@@ -40,7 +47,6 @@ import shutil
 import sqlite3
 import tempfile
 import time
-from urllib.parse import urlencode
 
 from .base import ScrapeResult, DATA_DIR, profile_dir
 from ._browser import (
@@ -112,11 +118,9 @@ COMPOSER_SELECTORS = (
 )
 COMPOSER_SEL = ", ".join(COMPOSER_SELECTORS)
 
-# The send control. Anonymous `?q=` auto-submits, so this was never needed --
-# SIGNED IN it is: chatgpt.com/?q=… drops the text into the composer and then
-# waits for a human to press send, so the prompt just sat there and RESP_SEL
-# never appeared. data-testid first (stable across builds), id second, the
-# aria-labels last because the wording changes.
+# The send control. Only a FALLBACK -- Enter is the normal way the prompt
+# goes (see _type_and_send). data-testid first (stable across builds), id
+# second, the aria-labels last because the wording changes.
 SEND_SELECTORS = (
     "button[data-testid='send-button']",
     "#composer-submit-button",
@@ -212,12 +216,15 @@ def _resolve_profiles() -> list[str]:
         return everything
     signed = [p for p in everything if _has_session_cookie(p)]
     if not signed:
-        # Nothing is signed in — run anonymous across the full pool rather
-        # than refusing to work. That is the documented fallback, not an error.
-        print("[chatgpt] no signed-in profile found — running anonymous "
-              f"across {len(everything)} slot(s). "
-              "`python -m scrapers.login chatgpt` signs in all of them.")
-        return everything
+        # Deliberately NOT falling back to the anonymous profiles. Doing that
+        # silently swapped in a logged-out browser whenever the signed-in one
+        # was unavailable, so a run looked like it was using the account when
+        # it was not -- and the anonymous path is the one Cloudflare blocks.
+        # Better to stop and say so.
+        print("[chatgpt] NO signed-in profile — refusing to fall back to an "
+              "anonymous browser. Run `python -m scrapers.login chatgpt` "
+              "(or set CHATGPT_SIGNED_IN_ONLY=0 to allow logged-out runs).")
+        return []
     if len(signed) < len(everything):
         print(f"[chatgpt] using {len(signed)} signed-in profile(s) "
               f"({', '.join(signed)}); {len(everything) - len(signed)} "
@@ -230,7 +237,14 @@ def _resolve_profiles() -> list[str]:
 # some profiles are signed in, so every slot->dir lookup must go through here.
 PROFILES = _resolve_profiles()
 POOL_SIZE = len(PROFILES)
-_POOL = SlotPool(POOL_SIZE)
+# max(1, …) only so SlotPool is constructible when PROFILES is empty; nothing
+# runs in that state — _scrape_once refuses before it reaches a browser.
+_POOL = SlotPool(max(1, POOL_SIZE))
+
+NO_PROFILE_ERROR = (
+    "No signed-in ChatGPT profile. Run `python -m scrapers.login chatgpt` on "
+    "this machine, then re-run the scan. (CHATGPT_SIGNED_IN_ONLY=0 allows "
+    "anonymous runs, which Cloudflare usually blocks.)")
 
 # {slot: session}, each reused across keywords and bound to the loop that made it.
 _SESSIONS: dict[int, dict] = {}
@@ -450,6 +464,9 @@ async def unlock_turnstile(timeout_s: int = 600) -> bool:
     on each slot would still hang. Opens them one at a time; a window appears for
     each, and closes itself once the composer is reachable.
     """
+    if not PROFILES:
+        print(f"[chatgpt] nothing to warm — {NO_PROFILE_ERROR}")
+        return False
     ok = True
     for i, prof in enumerate(PROFILES):
         print(f"[chatgpt] warming profile {prof} ({i + 1}/{len(PROFILES)}) …")
@@ -518,56 +535,85 @@ async def _sent(page, timeout_ms: int = 6_000) -> bool:
     return False
 
 
-async def _ensure_submitted(page, prompt: str) -> bool:
-    """Make sure the prompt is actually SENT. True when we had to send it.
+async def _clear_composer(page) -> None:
+    """Empty the composer before typing.
 
-    Covers both flows from one place:
-      * anonymous -- `?q=` auto-submits, the composer is already empty, and
-        this returns False without touching anything.
-      * signed in -- `?q=` only PREFILLS and waits for a human.
-
-    ENTER is the primary action, the send button only a fallback. Enter goes
-    through the composer's own key handler, which is the same path a person
-    takes; clicking the button depends on hitting the right element while it
-    is enabled and unobscured, and that is what was silently doing nothing.
+    A reused tab can come back with a restored draft, and ChatGPT keeps one
+    per conversation. Typing into that appends, so the previous keyword
+    would ride along on the front of this one.
     """
-    text = await _composer_text(page)
-    if text is None:
-        return False            # no composer -- already in a conversation
-    if not text.strip():
-        # Either it auto-submitted (anonymous) or the prefill was ignored.
-        # An existing assistant turn tells those two apart.
+    for combo in ("ControlOrMeta+a", "Control+a", "Meta+a"):
         try:
-            if await page.locator(RESP_SEL).count():
-                return False
+            await page.keyboard.press(combo)
+            await page.keyboard.press("Backspace")
+            return
         except Exception:
-            return False
+            continue
+
+
+async def _type_and_send(page, prompt: str) -> bool:
+    """Type the prompt into the composer and press Enter. True when sent.
+
+    This is the ONLY submit path (2026-10-13, at the user's request). The
+    `?q=` prefill URL it replaced auto-submitted for anonymous visitors but
+    merely filled the box when signed in, so prompts sat there unsent.
+    Typing and pressing Enter behaves the same either way.
+
+    ENTER is the action, the send button only a fallback. Enter goes through
+    the composer's own key handler -- the same path a person takes. Clicking
+    the button depends on hitting the right element while it is enabled and
+    unobscured, which is what was silently doing nothing.
+    """
+    try:
+        composer = page.locator(COMPOSER_SEL).first
+        await composer.wait_for(state="visible", timeout=30_000)
+    except Exception:
+        print("[chatgpt] composer never appeared — cannot type the prompt")
+        return False
+
+    try:
+        await composer.click(timeout=8_000)
+    except Exception:
+        pass
+    await _clear_composer(page)
+
+    try:
+        # insert_text, not type(): ProseMirror handles a paste-style insert
+        # cleanly, and a long prompt typed key-by-key is slow enough that the
+        # send control can re-disable part-way through.
+        await page.keyboard.insert_text(prompt)
+    except Exception:
+        return False
+
+    # Confirm the text actually landed. insert_text goes to whatever holds
+    # focus, so a stolen focus silently types the prompt into nothing.
+    got = (await _composer_text(page) or "")
+    if prompt[:40] not in got:
         try:
-            await page.locator(COMPOSER_SEL).first.click(timeout=5_000)
-            # insert_text, not type(): ProseMirror handles a paste-style
-            # insert cleanly, and a long prompt typed key-by-key is slow
-            # enough that the send control can re-disable mid-way.
-            await page.keyboard.insert_text(prompt)
+            await composer.click(timeout=5_000)
+            await _clear_composer(page)
+            await composer.type(prompt, delay=8, timeout=60_000)
         except Exception:
+            pass
+        got = (await _composer_text(page) or "")
+        if prompt[:40] not in got:
+            print("[chatgpt] prompt did not land in the composer")
             return False
 
-    # Settle first. The send button going enabled is the signal that the
-    # editor has registered its content and the composer is wired up --
-    # pressing Enter before that is swallowed.
+    # Settle before acting. The send button going enabled is the signal that
+    # the editor has registered its content and the composer is wired up --
+    # an Enter pressed before that is swallowed.
     await _wait_send_ready(page)
-
-    composer = page.locator(COMPOSER_SEL).first
 
     # 1. Enter, from the composer itself.
     try:
-        await composer.click(timeout=5_000)
         await composer.press("Enter", timeout=5_000)
         if await _sent(page):
             return True
     except Exception:
         pass
 
-    # 2. Enter again at the keyboard level, in case the click moved focus.
+    # 2. Enter again at the keyboard level, in case focus moved.
     try:
         await composer.focus(timeout=3_000)
         await page.keyboard.press("Enter")
@@ -601,7 +647,7 @@ def _is_chatgpt_backend(url: str) -> bool:
 async def _ensure_session(slot: int = 0) -> dict:
     """Return a live session for the current loop, launching one headed Chrome
     if needed. Reuses the open Chrome/tab across keywords (the whole point) and
-    clears Turnstile once on the homepage so later `?q=` navigations sail through.
+    clears Turnstile once on the homepage so later navigations sail through.
     Mirrors scrapers/google.py's `_ensure_session`."""
     loop = asyncio.get_running_loop()
 
@@ -686,7 +732,7 @@ async def _ensure_session(slot: int = 0) -> dict:
     except Exception:
         pass
     # Clear the Cloudflare challenge a single time; the cf_clearance cookie then
-    # persists for the rest of the batch so per-keyword `?q=` loads don't re-gate.
+    # persists for the rest of the batch so per-keyword loads don't re-gate.
     await _solve_turnstile(page)
     await _dismiss_modals(page)
 
@@ -738,6 +784,13 @@ async def scrape(prompt: str, headless: bool = True) -> ScrapeResult:
     cf_clearance and the retry is fast.
     """
     global _WARMED
+    if not PROFILES:
+        # Fail every keyword the same way, immediately. Retrying cannot
+        # conjure a login, and the retry must not reach for an anonymous
+        # browser instead.
+        res = ScrapeResult(platform="chatgpt", prompt=prompt)
+        res.error = NO_PROFILE_ERROR
+        return res
     budget = COLD_BUDGET_S if not _WARMED else WARM_BUDGET_S
     try:
         res = await asyncio.wait_for(_scrape_once(prompt, headless), timeout=budget)
@@ -777,6 +830,10 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
     # The shared session means we hold the lock for the whole search and reuse
     # the one open tab (see module docstring) instead of relaunching Chrome.
     res = ScrapeResult(platform="chatgpt", prompt=prompt)
+    if not PROFILES:
+        # Stop here rather than launching a logged-out browser.
+        res.error = NO_PROFILE_ERROR
+        return res
     async with _POOL.slot() as slot:
         try:
             sess = await _ensure_session(slot)
@@ -788,15 +845,16 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
             )
             page.on("response", handler)
             try:
-                # 1. Navigate the EXISTING tab to the search URL — ChatGPT
-                #    auto-submits the prompt from the `q` query param (no
-                #    composer interaction, sidestepping ProseMirror selector
-                #    drift). Reusing the warm tab means Turnstile is already
-                #    cleared, so this load goes straight to the answer.
-                prefill_url = "https://chatgpt.com/?" + urlencode({"q": prompt})
+                # 1. Navigate the EXISTING tab to a fresh chat. Plain
+                #    chatgpt.com, NOT the `?q=` prefill: that auto-submitted
+                #    for anonymous visitors but only filled the box once
+                #    signed in, leaving the prompt unsent. We type it and
+                #    press Enter instead, which behaves the same either way.
+                #    Reloading the base URL also guarantees an empty
+                #    conversation, so keywords never pile into one thread.
                 try:
                     await page.goto(
-                        prefill_url,
+                        "https://chatgpt.com/",
                         wait_until="domcontentloaded",
                         timeout=60_000,
                     )
@@ -818,13 +876,10 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                 if await _retry_verification(page):
                     await wait_quiet(page, idle_ms=250, net_idle=False)
 
-                # 1b. SEND it. Signed in, `?q=` prefills the composer and
-                #     stops there -- only the anonymous UI auto-submits. The
-                #     prompt was sitting unsent while we waited 60s for a
-                #     reply to a question nobody had asked yet.
-                if await _ensure_submitted(page, prompt):
+                # 1b. Type the prompt and press Enter.
+                if await _type_and_send(page, prompt):
                     await wait_quiet(page, idle_ms=250, net_idle=False)
-                    # Verification fails on SUBMIT, so re-check after our click.
+                    # Verification fails on SUBMIT, so re-check afterwards.
                     if await _retry_verification(page):
                         await wait_quiet(page, idle_ms=250, net_idle=False)
 
