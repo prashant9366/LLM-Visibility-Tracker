@@ -73,8 +73,18 @@ from ._browser import (
 #                           encrypts cookie values with a key bound to the
 #                           Chrome executable, which bundled Chromium cannot
 #                           decrypt. Expect to sign in again if you use it.
+#   simple                — bare Playwright Chromium. No profile directory,
+#                           no cookies, no login, none of the hardening. One
+#                           browser.launch(), one context, one page. Runs
+#                           ANONYMOUS, which is the path Cloudflare checks
+#                           hardest, so expect Turnstile.
 CHATGPT_ENGINE = (os.getenv("CHATGPT_ENGINE", "patchright").strip().lower()
                   or "patchright")
+
+# The bare path, chosen 2026-10-13. Deliberately skips the signed-in-profile
+# requirement: there is no profile to be signed in. Everything that exists to
+# protect or reuse a login is bypassed, not just unused.
+SIMPLE = CHATGPT_ENGINE == "simple"
 
 try:
     if CHATGPT_ENGINE != "patchright":
@@ -95,6 +105,8 @@ except Exception as _e:  # pragma: no cover
               f"({type(_e).__name__}) — falling back to vanilla Playwright, "
               "which Cloudflare fingerprints. Fix with:\n"
               "    pip install patchright && python -m patchright install chrome")
+    elif CHATGPT_ENGINE == "simple":
+        pass                      # announced by _resolve_profiles instead
     else:
         print(f"[chatgpt] engine: {CHATGPT_ENGINE} (plain Playwright"
               + (", bundled Chromium)" if CHATGPT_ENGINE == "chromium"
@@ -140,31 +152,40 @@ ANSWER_CONTAINERS = (
 # Done in JS rather than via locators because ChatGPT re-renders the markdown
 # subtree on every streamed token: an element handle resolved on the Python
 # side keeps detaching mid-call.
+# Returns {text, links} from the SAME node. Measured live 2026-10-13: the
+# citations are ordinary <a href> inside the answer -- the old
+# [data-assistant-sources-payload] chips are gone (0 nodes on the page) and
+# the network capture yields nothing. So the anchors ARE the sources, and
+# reading them from a different element than the text is how they go missing.
 _PICK_ANSWER_JS = """
 (sels) => {
   const textOf = (n) => ((n && n.innerText) || '').trim();
+  const linksOf = (n) => !n ? [] : Array.from(n.querySelectorAll('a'))
+      .map(a => a.href).filter(h => /^https?:/i.test(h));
+  const pack = (n) => ({ text: textOf(n), links: linksOf(n) });
   // 1. A real assistant turn, newest first.
   for (const s of sels.containers) {
     let m;
     try { m = document.querySelectorAll(s); } catch (e) { continue; }
     if (m.length) {
-      const t = textOf(m[m.length - 1]);
-      if (t) return t;
+      const got = pack(m[m.length - 1]);
+      if (got.text) return got;
     }
   }
-  // 2. Otherwise the LONGEST block any selector matches. Length is the
-  //    tie-break that makes this robust to the class names rotating:
-  //    the answer is always the biggest thing on the page.
-  let best = '';
+  // 2. Otherwise the node with the LONGEST text. Length is the tie-break
+  //    that makes this robust to class names rotating: the answer is always
+  //    the biggest thing on the page. Chosen as a NODE, not as a string, so
+  //    its anchors come back with it.
+  let best = null, bestLen = -1;
   for (const s of sels.any) {
     let m;
     try { m = document.querySelectorAll(s); } catch (e) { continue; }
     for (const n of m) {
-      const t = textOf(n);
-      if (t.length > best.length) best = t;
+      const len = textOf(n).length;
+      if (len > bestLen) { bestLen = len; best = n; }
     }
   }
-  return best;
+  return best ? pack(best) : { text: '', links: [] };
 }
 """
 
@@ -226,15 +247,32 @@ async def _regenerate_if_failed(page, *, attempts: int = 2) -> bool:
     return issued
 
 
-async def _answer_text(page) -> str:
-    """The assistant's answer, or '' when it is not on the page yet."""
+# Screen-reader label the turn container carries ("ChatGPT said:" / "You
+# said:"). Seen live on the extracted text; stripped so it does not show up
+# as the first line of every stored answer.
+_SPEAKER_PREFIX_RE = re.compile(r"^\s*(?:chatgpt|you)\s+said:\s*", re.I)
+
+
+async def _answer_payload(page) -> dict:
+    """{'text': str, 'links': [str]} for the assistant turn, from one node."""
     try:
-        return (await page.evaluate(
+        got = await page.evaluate(
             _PICK_ANSWER_JS,
             {"containers": list(ANSWER_CONTAINERS),
-             "any": list(RESP_SELECTORS)})) or ""
+             "any": list(RESP_SELECTORS)})
     except Exception:
-        return ""
+        return {"text": "", "links": []}
+    if not isinstance(got, dict):
+        return {"text": "", "links": []}
+    return {
+        "text": _SPEAKER_PREFIX_RE.sub("", got.get("text") or "").strip(),
+        "links": [u for u in (got.get("links") or []) if isinstance(u, str)],
+    }
+
+
+async def _answer_text(page) -> str:
+    """The assistant's answer, or '' when it is not on the page yet."""
+    return (await _answer_payload(page))["text"]
 
 
 async def _wait_answer_stable(page, *, idle_ms: int = 1400,
@@ -275,6 +313,12 @@ async def _wait_answer_stable(page, *, idle_ms: int = 1400,
 # which never becomes visible, so wait_for_selector(state="visible") times
 # out. List ONLY selectors that uniquely target the real composer.
 COMPOSER_SELECTORS = (
+    # Measured live 2026-10-13: the anonymous UI is a plain <textarea
+    # id="mobile-composer-prompt">; every contenteditable selector below
+    # matches ZERO elements there. Listed first so the common case resolves
+    # on the first try, with the div chain kept for the signed-in UI.
+    "textarea#mobile-composer-prompt",
+    "textarea#prompt-textarea",
     "div#prompt-textarea[contenteditable='true']",
     "div[contenteditable='true'].ProseMirror",
     "div[aria-label='Chat with ChatGPT'][contenteditable='true']",
@@ -387,6 +431,13 @@ def _has_session_cookie(profile_name: str) -> bool:
 def _resolve_profiles() -> list[str]:
     """Profile dirs this run will drive, in slot order."""
     everything = [f"chatgpt_{i}" for i in range(POOL_WIDTH)]
+    if SIMPLE:
+        # No profiles at all. The names are placeholders that only size the
+        # pool; nothing reads them. Returning them keeps the "do we have
+        # somewhere to run?" guards satisfied without a special case at each.
+        print(f"[chatgpt] engine: simple — bare Chromium, no profile, "
+              f"NO LOGIN, {POOL_WIDTH} browser(s)")
+        return everything
     if not SIGNED_IN_ONLY:
         return everything
     signed = [p for p in everything if _has_session_cookie(p)]
@@ -639,6 +690,10 @@ async def unlock_turnstile(timeout_s: int = 600) -> bool:
     on each slot would still hang. Opens them one at a time; a window appears for
     each, and closes itself once the composer is reachable.
     """
+    if SIMPLE:
+        # Nothing persists between runs, so there is no clearance to pre-earn.
+        print("[chatgpt] engine=simple — no profiles to warm")
+        return True
     if not PROFILES:
         print(f"[chatgpt] nothing to warm — {NO_PROFILE_ERROR}")
         return False
@@ -655,15 +710,71 @@ async def unlock_turnstile(timeout_s: int = 600) -> bool:
     return ok
 
 
+async def _composer(page):
+    """The real editor, resolved by selector PRIORITY — not DOM order.
+
+    `page.locator(COMPOSER_SEL).first` looks right and is not: a comma-joined
+    selector returns the first match in DOCUMENT order, so the hidden
+    <textarea id="prompt-textarea"> that ChatGPT ships as a fallback wins over
+    the contenteditable div that comes after it. Typing then lands in the
+    visible editor (keyboard input follows focus) while press()/click() are
+    aimed at the hidden one -- which is exactly "text is in the box but Enter
+    does nothing". Walk the list in order and take the first VISIBLE match.
+    """
+    for sel in COMPOSER_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+# Read the composer's CURRENT content, whichever element type it is.
+#
+# Measured live 2026-10-13: anonymous chatgpt.com now ships a plain
+# <textarea id="mobile-composer-prompt"> -- every contenteditable selector
+# matches zero elements. `inner_text()` on a textarea returns its original
+# markup, NOT what was typed, so it reads '' no matter what is in the box:
+#
+#     inner_text()  -> ''
+#     input_value() -> 'best cashback site in india'
+#
+# That single mismatch was the whole "stuck after typing" failure. The typed
+# text verification below saw '', concluded the prompt had not landed, retyped
+# it, saw '' again and gave up -- returning before it ever pressed Enter.
+_COMPOSER_VALUE_JS = (
+    "e => (e.value !== undefined && e.value !== null) "
+    "? String(e.value) : (e.innerText || '')"
+)
+
+
 async def _composer_text(page) -> str | None:
     """Text sitting in the composer, or None when there is no composer."""
     try:
-        comp = page.locator(COMPOSER_SEL).first
-        if not await comp.count():
+        comp = await _composer(page)
+        if comp is None:
             return None
-        return (await comp.inner_text()) or ""
+        return (await comp.evaluate(_COMPOSER_VALUE_JS)) or ""
     except Exception:
         return None
+
+
+# Click the send button from inside the page. Bypasses Playwright's
+# actionability checks entirely, which is the point: a button covered by an
+# invisible overlay, or one Playwright judges "not stable", silently refuses a
+# normal click and raises nothing useful.
+_JS_SEND = """
+(sels) => {
+  for (const s of sels) {
+    let b;
+    try { b = document.querySelector(s); } catch (e) { continue; }
+    if (b && !b.disabled && b.offsetParent !== null) { b.click(); return s; }
+  }
+  return null;
+}
+"""
 
 
 async def _wait_send_ready(page, timeout_ms: int = 20_000):
@@ -740,9 +851,12 @@ async def _type_and_send(page, prompt: str) -> bool:
     unobscured, which is what was silently doing nothing.
     """
     try:
-        composer = page.locator(COMPOSER_SEL).first
-        await composer.wait_for(state="visible", timeout=30_000)
+        await page.wait_for_selector(COMPOSER_SEL, state="visible",
+                                     timeout=30_000)
     except Exception:
+        pass
+    composer = await _composer(page)
+    if composer is None:
         print("[chatgpt] composer never appeared — cannot type the prompt")
         return False
 
@@ -797,7 +911,7 @@ async def _type_and_send(page, prompt: str) -> bool:
     except Exception:
         pass
 
-    # 3. Last resort: the send button.
+    # 3. The send button, clicked normally.
     btn = await _wait_send_ready(page, timeout_ms=5_000)
     if btn is not None:
         try:
@@ -807,8 +921,20 @@ async def _type_and_send(page, prompt: str) -> bool:
         except Exception:
             pass
 
-    print("[chatgpt] prompt is still sitting in the composer — Enter and the "
-          "send button both failed to submit it")
+    # 4. The send button, clicked from inside the page. Last resort because it
+    #    skips every actionability guarantee -- but an overlay or a "not
+    #    stable" verdict is precisely what would have defeated step 3.
+    try:
+        hit = await page.evaluate(_JS_SEND, list(SEND_SELECTORS))
+        if hit:
+            print(f"[chatgpt] sent via in-page click on {hit}")
+            if await _sent(page):
+                return True
+    except Exception:
+        pass
+
+    print("[chatgpt] prompt is still sitting in the composer — Enter, the send "
+          "button and an in-page click all failed to submit it")
     return False
 
 
@@ -838,6 +964,30 @@ async def _ensure_session(slot: int = 0) -> dict:
             return sess
         # Stale (loop changed or page died) — tear this slot down before relaunching.
         await _close_slot(slot)
+
+    if SIMPLE:
+        # Bare Playwright. launch() + new_context() + new_page(), nothing
+        # else: no user_data_dir, no channel, no args, no sandbox flag, no
+        # crash-bubble handling, no profile sanitising. Each slot gets its
+        # own browser, which is free here because there is no profile
+        # directory to contend over.
+        pw = await async_patchright().start()
+        browser = await pw.chromium.launch(headless=False)
+        ctx = await browser.new_context(viewport={"width": 1280, "height": 900})
+        page = await ctx.new_page()
+        try:
+            await page.goto("https://chatgpt.com/",
+                            wait_until="domcontentloaded", timeout=60_000)
+        except Exception:
+            pass
+        # Still worth clearing once per browser: the cf_clearance cookie lives
+        # in the context, so later keywords on this slot skip the challenge.
+        await _solve_turnstile(page)
+        await _dismiss_modals(page)
+        sess = {"pw": pw, "browser": browser, "ctx": ctx, "page": page,
+                "loop": loop}
+        _SESSIONS[slot] = sess
+        return sess
 
     # Each slot needs its OWN profile: one directory cannot back two live
     # browsers. Indexed through PROFILES, which may hold only the signed-in
@@ -927,6 +1077,13 @@ async def _close_slot(slot: int) -> None:
         await sess["ctx"].close()
     except Exception:
         pass
+    # Only the simple path has a separate Browser object; a persistent context
+    # IS the browser. Leaving it unclosed leaks a Chromium process per slot.
+    if sess.get("browser") is not None:
+        try:
+            await sess["browser"].close()
+        except Exception:
+            pass
     try:
         await sess["pw"].stop()
     except Exception:
@@ -1103,15 +1260,21 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                                      "send button both did nothing).")
                         return res
                     if stuck:
-                        res.error = (
-                            "Cloudflare verification failed on submit (Retry did "
-                            "not clear it)."
-                            if SIGNED_IN_ONLY and _has_session_cookie(
-                                PROFILES[slot % len(PROFILES)])
-                            else "Cloudflare verification failed on submit "
-                                 "(Retry did not clear it). This profile is "
-                                 "ANONYMOUS, which gets the strictest check -- "
-                                 "run `python -m scrapers.login chatgpt`.")
+                        base = ("Cloudflare verification failed on submit "
+                                "(Retry did not clear it).")
+                        if SIMPLE:
+                            res.error = (
+                                base + " CHATGPT_ENGINE=simple runs ANONYMOUS "
+                                "with no cookies, which gets the strictest "
+                                "check. Unset it to use the signed-in profile.")
+                        elif SIGNED_IN_ONLY and _has_session_cookie(
+                                PROFILES[slot % len(PROFILES)]):
+                            res.error = base
+                        else:
+                            res.error = (
+                                base + " This profile is ANONYMOUS, which gets "
+                                "the strictest check -- run "
+                                "`python -m scrapers.login chatgpt`.")
                     else:
                         res.error = "Assistant response never appeared."
                     return res
@@ -1143,7 +1306,8 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                 # Same picker the stability wait used, so what we measured is
                 # what we read. Re-run rather than trusting `stable_text`: the
                 # citation wait above can attach chips that add text.
-                txt = (await _answer_text(page)) or stable_text
+                payload = await _answer_payload(page)
+                txt = payload["text"] or stable_text
                 if txt and _RESPONSE_FAILED_RE.search(txt[:400]):
                     # Don't store ChatGPT's failure notice as the answer --
                     # it would look like a real (and very wrong) result in
@@ -1172,14 +1336,12 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                         except Exception:
                             continue
 
-                visible_anchors: list[str] = []
-                if await last_msg.count():
-                    try:
-                        visible_anchors = await last_msg.locator("a").evaluate_all(
-                            "els => els.map(e => e.href).filter(h => h && /^https?:/.test(h))"
-                        )
-                    except Exception:
-                        visible_anchors = []
+                # Anchors from the SAME node the text came from. (This block
+                # used to read `last_msg`, a variable that stopped existing
+                # when the text extraction above was rewritten -- so link
+                # collection died with a NameError before it looked at a
+                # single anchor. That is why no links were coming through.)
+                visible_anchors = payload["links"]
 
                 citations: list[str] = []
                 for h in visible_anchors:
