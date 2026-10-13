@@ -235,13 +235,26 @@ _load_env_file()
 #     https://api.buyproxies.org/?a=showProxies&pid=...&key=...&port=12345
 #     -> 100 lines of  host:port:user:pass
 #
-# Cached to data/proxies.txt for PROXY_CACHE_TTL and refetched after that.
-# Refetching is the point: a hand-maintained list cannot tell you its exits
-# have been reassigned, so it goes quietly dead and every scrape fails for a
-# day before anyone looks. The API returns the account's CURRENT assignment.
+# THE URL IS THE SOURCE OF TRUTH. data/proxies.txt is a crash-mat for when the
+# API is unreachable, not a cache to read from in normal operation.
+#
+# It used to be a real 1-hour cache, and that was wrong: BuyProxies reassigns
+# exits, so for up to an hour after a refresh every scrape was being handed
+# IPs the account no longer owns. Those do not fail cleanly -- they answer,
+# and Google serves a CAPTCHA. Repeated CAPTCHAs with "rotating (1/2), (2/2)"
+# in the log is what a stale list looks like from the outside.
+#
+# PROXY_CACHE_TTL=0 (the default) means always refetch. Set it to a number of
+# seconds only if the API starts rate-limiting.
 PROXY_CACHE = Path(__file__).resolve().parent.parent / "data" / "proxies.txt"
-PROXY_CACHE_TTL = 3600
+PROXY_CACHE_TTL = int(os.getenv("PROXY_CACHE_TTL", "0"))
 PROXY_FETCH_TIMEOUT = 30
+
+# Collapses the burst when several slots launch at once -- three browsers
+# starting together must not mean three identical API calls. Short enough that
+# a rotation mid-scan is still picked up on the next launch.
+PROXY_FETCH_DEBOUNCE = int(os.getenv("PROXY_FETCH_DEBOUNCE", "10"))
+_proxy_memo: dict = {"at": 0.0, "servers": []}
 
 _proxy_lock = threading.Lock()
 
@@ -254,10 +267,18 @@ def _parse_proxy_lines(text: str) -> list[str]:
     PROXY_USER / PROXY_PASS separately -- so the credentials are lifted out of
     the list and the list itself stays shareable.
 
-    setdefault, not assignment: anything already exported wins, which keeps a
-    manually overridden credential working.
+    The API response WINS over whatever is already in the environment. It used
+    to be setdefault, so a .env credential stuck forever -- and when BuyProxies
+    rotates the account password the exits then answer with an auth failure
+    that Google reports as a CAPTCHA, not as a proxy error. The list that
+    names these exits is the thing that knows their password.
+
+    Set PROXY_CREDS_PIN=1 to keep the .env values regardless.
     """
+    pin = (os.getenv("PROXY_CREDS_PIN") or "").strip().lower() in (
+        "1", "true", "yes", "on")
     servers: list[str] = []
+    user = password = None
     for line in (text or "").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -265,10 +286,21 @@ def _parse_proxy_lines(text: str) -> list[str]:
         parts = line.split(":")
         if len(parts) >= 4:
             servers.append(f"{parts[0]}:{parts[1]}")
-            os.environ.setdefault("PROXY_USER", parts[2])
-            os.environ.setdefault("PROXY_PASS", ":".join(parts[3:]))
+            user, password = parts[2], ":".join(parts[3:])
         elif len(parts) == 2:
             servers.append(line)
+    if user and not pin:
+        if os.environ.get("PROXY_USER") not in (None, "", user):
+            print("[proxies] account username changed — using the one from "
+                  "the API (PROXY_CREDS_PIN=1 keeps your .env value)")
+        if os.environ.get("PROXY_PASS") not in (None, "", password):
+            print("[proxies] account password changed — using the one from "
+                  "the API (PROXY_CREDS_PIN=1 keeps your .env value)")
+        os.environ["PROXY_USER"] = user
+        os.environ["PROXY_PASS"] = password
+    elif user:
+        os.environ.setdefault("PROXY_USER", user)
+        os.environ.setdefault("PROXY_PASS", password)
     return servers
 
 
@@ -278,12 +310,20 @@ def _proxies_from_api() -> list[str]:
     if not url:
         return []
     with _proxy_lock:
-        try:
-            age = time.time() - PROXY_CACHE.stat().st_mtime
-            if age < PROXY_CACHE_TTL:
-                return _parse_proxy_lines(PROXY_CACHE.read_text(encoding="utf-8"))
-        except OSError:
-            pass
+        now = time.time()
+        # Debounce only — this is not the cache, it just stops N simultaneous
+        # launches making N identical calls a second apart.
+        if (_proxy_memo["servers"]
+                and now - _proxy_memo["at"] < PROXY_FETCH_DEBOUNCE):
+            return list(_proxy_memo["servers"])
+        # Opt-in disk cache. Off by default (TTL 0) so the URL is always asked.
+        if PROXY_CACHE_TTL > 0:
+            try:
+                if now - PROXY_CACHE.stat().st_mtime < PROXY_CACHE_TTL:
+                    return _parse_proxy_lines(
+                        PROXY_CACHE.read_text(encoding="utf-8"))
+            except OSError:
+                pass
         try:
             import requests
             r = requests.get(url, timeout=PROXY_FETCH_TIMEOUT)
@@ -292,9 +332,11 @@ def _proxies_from_api() -> list[str]:
             if servers:
                 PROXY_CACHE.parent.mkdir(parents=True, exist_ok=True)
                 PROXY_CACHE.write_text(r.text, encoding="utf-8")
+                _proxy_memo.update(at=now, servers=list(servers))
                 return servers
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[proxies] API fetch failed ({type(e).__name__}) — "
+                  "falling back to the last saved list, which may be stale")
         # API unreachable: a stale list beats no list. These exits usually
         # still work -- the assignment changes rarely -- and failing over to
         # "no proxy" would send every request from the server's own IP, which
