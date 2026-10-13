@@ -1,12 +1,21 @@
 """One-shot interactive login helper.
 
-Opens a real browser window on the platform's PERSISTENT profile directory, hands
-you the keyboard, and waits until you're signed in. The session cookies are written
-into `data/profiles/<platform>/`, so every later scrape reuses them headlessly and
-never has to log in again.
+Opens a real browser window on the profile directory the scraper actually reads,
+hands you the keyboard, and waits until you're signed in. The session cookies are
+written into `data/profiles/`, so every later scrape reuses them and never has to
+log in again.
 
     python3 -m scrapers.login perplexity
+    python3 -m scrapers.login chatgpt
     python3 -m scrapers.login perplexity --timeout 600
+
+POOLED PLATFORMS (chatgpt, google) run several browsers at once, each on its own
+profile dir — chatgpt_0, chatgpt_1, chatgpt_2. One login cannot cover them from a
+shared directory, so this signs in on slot 0 and then COPIES that profile over
+every other slot. Signing in by hand into one scraper window only ever covers the
+slot that window happened to own; the rest keep running anonymous.
+
+    python3 -m scrapers.login chatgpt        # all CHATGPT_POOL slots
 
 Re-run it whenever a scraper reports that the session has expired.
 
@@ -17,12 +26,76 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import shutil
 import sys
 import time
 from urllib.parse import quote_plus
 
 from .base import profile_dir
 from ._browser import persistent_context
+
+# Platforms whose scraper runs a POOL of browsers, each on its own profile dir
+# (chatgpt_0, chatgpt_1, …) because one directory cannot back two live Chromes.
+#
+# This is why signing in used to appear to do nothing: the helper wrote
+# data/profiles/chatgpt while the scraper only ever opens chatgpt_<slot>, so
+# the session was saved to a directory nothing reads. Logging in now targets
+# slot 0 and REPLICATES it across the pool, so every slot is signed in.
+POOLED = {
+    "chatgpt": ("CHATGPT_POOL", 3),
+    "google": ("GOOGLE_POOL", 3),
+}
+
+# Junk that must not be copied between slots: lock files make the copy look
+# like a running browser, and the caches are large and rebuilt on demand.
+_NO_COPY = shutil.ignore_patterns(
+    "Singleton*", "*.lock", "LOCK", "lockfile",
+    "Cache", "Code Cache", "GPUCache", "ShaderCache", "GrShaderCache",
+    "DawnCache", "DawnGraphiteCache", "DawnWebGPUCache",
+    "Crashpad", "CrashpadMetrics*", "component_crx_cache", "extensions_crx_cache",
+)
+
+
+def pool_names(platform: str) -> list[str]:
+    """Profile names the scraper will actually open, in slot order."""
+    spec = POOLED.get(platform)
+    if not spec:
+        return [platform]
+    env, default = spec
+    try:
+        size = max(1, int(os.getenv(env, str(default))))
+    except ValueError:
+        size = default
+    return [f"{platform}_{i}" for i in range(size)]
+
+
+def replicate_profile(src_name: str, dst_names: list[str]) -> int:
+    """Copy a signed-in profile over every other slot. Returns the count done.
+
+    MUST run with every browser closed -- Chrome flushes cookies lazily, so a
+    copy taken while it is live can miss the session entirely.
+
+    The whole directory is copied, not just Cookies: on Windows the cookie
+    values are encrypted with a key held in that profile's own `Local State`,
+    so a Cookies file lifted on its own lands somewhere that cannot decrypt it.
+    """
+    src = profile_dir(src_name)
+    done = 0
+    for name in dst_names:
+        dst = profile_dir(name)
+        if str(dst) == str(src):
+            continue
+        try:
+            # Replace rather than merge: a half-overwritten profile mixing two
+            # sessions' state is worse than either one on its own.
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst, ignore=_NO_COPY, dirs_exist_ok=True)
+            done += 1
+            print(f"  → copied to {dst.name}")
+        except OSError as e:
+            print(f"  ! could not copy to {name}: {type(e).__name__}: {e}")
+    return done
 
 # Where to land, and how to tell that a login actually took.
 #   cookie_names — any one of these on the site's domain means "signed in"
@@ -45,6 +118,13 @@ PLATFORMS = {
         "url": "https://gemini.google.com/app?hl=en-IN",
         "cookie_names": ("SID", "__Secure-1PSID"),
         "hint": "Sign in with your Google account.",
+    },
+    # Google AIO works signed-out, so this is optional — but a signed-in
+    # profile gets the consent wall out of the way and draws fewer CAPTCHAs.
+    "google": {
+        "url": "https://www.google.com/",
+        "cookie_names": ("SID", "__Secure-1PSID"),
+        "hint": "Sign in (top right), or just accept the consent dialog.",
     },
 }
 
@@ -135,7 +215,14 @@ async def interactive_login(platform: str, timeout_s: int = 600,
         # different browser engine, and logs in from a search — see _login_perplexity
         return await asyncio.to_thread(_login_perplexity, timeout_s, query)
     cfg = PLATFORMS[platform]
-    print(f"\nProfile: {profile_dir(platform)}")
+    # Sign in on the profile the scraper's first slot opens, NOT on a bare
+    # data/profiles/<platform> that nothing reads.
+    slots = pool_names(platform)
+    target = slots[0]
+    print(f"\nProfile: {profile_dir(target)}")
+    if len(slots) > 1:
+        print(f"Pool: {len(slots)} slots — this login will be copied to "
+              f"{', '.join(slots[1:])} once it takes.")
     print(f"Opening {cfg['url']} …")
     print(f"\n  → {cfg['hint']}")
     print("  → This window is a real browser; log in normally.")
@@ -144,7 +231,8 @@ async def interactive_login(platform: str, timeout_s: int = 600,
 
     # headed, and never block resources: this is a human-driven login, so the page
     # must render fully (images/fonts included) or the provider buttons look broken.
-    async with persistent_context(platform, headless=False, block_resources=False,
+    ok = False
+    async with persistent_context(target, headless=False, block_resources=False,
                                   engine="patchright") as ctx:
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         try:
@@ -155,10 +243,13 @@ async def interactive_login(platform: str, timeout_s: int = 600,
         waited = 0
         while waited < timeout_s:
             if await _logged_in(ctx, cfg["cookie_names"]):
-                print(f"\n✓ Signed in — session saved to {profile_dir(platform)}")
-                print("  Close-out in 3s; future scrapes will reuse it headlessly.")
+                ok = True
+                print(f"\n✓ Signed in — session saved to {profile_dir(target)}")
+                # Chrome writes cookies lazily. Closing the window too early is
+                # how a completed login still leaves an empty Cookies file.
+                print("  Letting cookies flush (3s) …")
                 await page.wait_for_timeout(3000)
-                return True
+                break
             try:
                 await page.wait_for_timeout(2000)
             except Exception:
@@ -166,14 +257,23 @@ async def interactive_login(platform: str, timeout_s: int = 600,
                 break
             waited += 2
 
-        ok = await _logged_in(ctx, cfg["cookie_names"])
-        if ok:
-            print(f"\n✓ Signed in — session saved to {profile_dir(platform)}")
-        else:
-            print("\n✗ No session cookie found. Either the login didn't complete, or "
-                  "the cookie name changed.\n  Re-run and finish the login, or check "
-                  f"PLATFORMS['{platform}']['cookie_names'] in scrapers/login.py.")
-        return ok
+        if not ok:
+            ok = await _logged_in(ctx, cfg["cookie_names"])
+            if ok:
+                print(f"\n✓ Signed in — session saved to {profile_dir(target)}")
+            else:
+                print("\n✗ No session cookie found. Either the login didn't complete, "
+                      "or the cookie name changed.\n  Re-run and finish the login, or "
+                      f"check PLATFORMS['{platform}']['cookie_names'] in "
+                      "scrapers/login.py.")
+
+    # OUTSIDE the context: the browser has now closed and the profile is fully
+    # written, which is the only safe moment to copy it.
+    if ok and len(slots) > 1:
+        print("\nCopying the signed-in profile across the pool …")
+        n = replicate_profile(target, slots[1:])
+        print(f"  {n + 1} of {len(slots)} slots signed in.")
+    return ok
 
 
 def main() -> int:
