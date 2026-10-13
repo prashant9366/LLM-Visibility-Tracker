@@ -128,6 +128,22 @@ _POOL = SlotPool(POOL_SIZE)
 # {slot: session}, each reused across keywords and bound to the loop that made it.
 _SESSIONS: dict[int, dict] = {}
 
+# NO PROXY. Tested 2026-10-13 and removed: routing this scraper through the
+# BuyProxies pool did not change the Turnstile failure, and it costs the thing
+# the tracker is measuring.
+#
+#   * REGION. Every exit in that pool is a US datacentre IP (ColoCrossing:
+#     23.x / 107.x / 192.3.x / 198.46.x), while the machines running this
+#     already egress from India. Direct IS the Indian path; proxying is what
+#     loses it, and a chat UI has no gl/hl override to win it back the way
+#     the Google AIO scraper does.
+#   * CLOUDFLARE. Anonymous ChatGPT is the hardest-scrutinised path (no
+#     account history to lean on) and a datacentre ASN is the strongest
+#     single negative signal Turnstile has.
+#
+# If exits are ever revisited here they need to be INDIAN RESIDENTIAL. This
+# pool cannot supply those, so there is nothing to re-enable.
+
 
 async def _dump_failure(page, tag: str) -> None:
     """Save screenshot + HTML so we can see what blocked the scraper."""
@@ -243,6 +259,59 @@ async def _solve_turnstile(page, *, total_timeout_ms: int = 30_000) -> bool:
         return False
 
 
+# The verification failure that appears INSIDE the composer, not as a
+# full-page interstitial: "An error occurred during verification, please try
+# again." with a Retry link beside it. _solve_turnstile never sees this --
+# the page title is not "Just a moment" and the challenge iframe is not
+# mounted, so it reports "no challenge" and the scrape waits for an answer
+# that is never coming.
+_VERIFY_ERROR_RE = re.compile(
+    r"error occurred during verification", re.I)
+
+
+async def _retry_verification(page, *, attempts: int = 3) -> bool:
+    """Click Retry while the composer is showing a verification error.
+
+    Returns True if the error was present at least once. Each Retry re-arms
+    Turnstile, so the solver is given another go in between -- the challenge
+    sometimes mounts properly on the second attempt when it failed silently
+    on the first.
+    """
+    seen = False
+    for _ in range(attempts):
+        try:
+            body = (await page.inner_text("body"))[:4000]
+        except Exception:
+            return seen
+        if not _VERIFY_ERROR_RE.search(body):
+            return seen
+        seen = True
+        clicked = False
+        # The link is a plain control with no stable test id, so match on
+        # its text -- scoped to the composer so a "Retry" elsewhere on the
+        # page cannot be hit by mistake.
+        for sel in ("form button:has-text('Retry')",
+                    "form a:has-text('Retry')",
+                    "button:has-text('Retry')",
+                    "a:has-text('Retry')"):
+            try:
+                loc = page.locator(sel).first
+                if await loc.count():
+                    await loc.click(timeout=4_000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            return seen
+        try:
+            await page.wait_for_timeout(1_500)
+        except Exception:
+            pass
+        await _solve_turnstile(page, total_timeout_ms=20_000)
+    return seen
+
+
 async def _unlock_one(profile: str, timeout_s: int) -> bool:
     """Clear Turnstile for ONE profile, leaving cf_clearance behind."""
     async with persistent_context(
@@ -326,6 +395,19 @@ async def _ensure_session(slot: int = 0) -> dict:
         headless=False,  # Turnstile blocks headless regardless of URL — always headed.
         viewport={"width": 1280, "height": 900},
         args=["--no-default-browser-check", *CRASH_BUBBLE_ARGS],
+        # Playwright defaults this to False, which injects --no-sandbox.
+        # Chrome then shows the yellow "unsupported command-line flag"
+        # infobar, and Turnstile reads that flag as automation and answers
+        # "An error occurred during verification, please try again."
+        # Anonymous ChatGPT worked before precisely because the anonymous
+        # path is the one Turnstile scrutinises hardest -- it has no account
+        # history to fall back on, so a single cheap tell is enough.
+        #
+        # This module launches its own context rather than going through
+        # _browser.persistent_context, so the same setting has to be made
+        # in both places. Changing one and not the other is why the banner
+        # survived the first fix.
+        chromium_sandbox=True,
     )
     if _HAS_PATCHRIGHT:
         kwargs["channel"] = "chrome"
@@ -492,13 +574,32 @@ async def _scrape_once(prompt: str, headless: bool = True) -> ScrapeResult:
                 # fires; the RESP_SEL wait below is the real readiness signal.
                 await wait_quiet(page, idle_ms=250, net_idle=False)
                 await _dismiss_modals(page)
+                # Turnstile can fail AFTER the prompt is submitted, as an
+                # inline composer error rather than an interstitial. Without
+                # this the scrape sits on wait_for_selector(RESP_SEL) for the
+                # full 60s and reports "Assistant response never appeared",
+                # which hides the real cause.
+                if await _retry_verification(page):
+                    await wait_quiet(page, idle_ms=250, net_idle=False)
 
                 # 2. Wait for the assistant turn.
                 try:
                     await page.wait_for_selector(RESP_SEL, timeout=60_000)
                 except Exception:
                     await _dump_failure(page, "response")
-                    res.error = "Assistant response never appeared."
+                    # Name the real cause when it is still on screen. "Assistant
+                    # response never appeared" sent us looking at selectors and
+                    # timeouts for a run that was actually blocked by Turnstile.
+                    try:
+                        stuck = _VERIFY_ERROR_RE.search(
+                            (await page.inner_text("body"))[:4000])
+                    except Exception:
+                        stuck = None
+                    res.error = (
+                        "Cloudflare verification failed on submit (Retry did not "
+                        "clear it). Anonymous sessions get the strictest check -- "
+                        "run `python -m scrapers.login chatgpt`."
+                        if stuck else "Assistant response never appeared.")
                     return res
 
                 await wait_for_stable_text(

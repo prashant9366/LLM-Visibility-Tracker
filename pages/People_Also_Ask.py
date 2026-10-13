@@ -40,6 +40,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Login gate -- a page under pages/ has its own URL and is reachable
+# directly, so gating app.py alone would leave this one open.
+from core.auth import require_login  # noqa: E402
+require_login(st)
+
 # Trimmed-down cut of the main app's violet/cyan dark theme — just the tokens
 # and widgets this page uses.
 CUSTOM_CSS = """

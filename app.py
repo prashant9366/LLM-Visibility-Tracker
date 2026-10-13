@@ -27,6 +27,7 @@ from core.storage import save_results, load_recent, clear_all, list_runs, load_r
 from core.settings import get_tracked_terms, set_tracked_terms, parse_terms_input
 from core.export import build_workbook
 from core.gsheets import render_input_source_sidebar
+from core.auth import require_login, logout, current_user, user_badge_html
 from core.ui import (
     PLATFORM_LABEL as _UI_PLATFORM_LABEL,
     PLATFORM_ROW_ORDER as _UI_PLATFORM_ROW_ORDER,
@@ -83,6 +84,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# Login gate. Must come before anything else renders: require_login calls
+# st.stop() when nobody is signed in, and anything drawn above it would be
+# visible to a stranger. The app drives paid proxies and signed-in LLM
+# accounts, so an open port 8501 is someone else spending your credits.
+_user = require_login(st)
 
 # Kill the sidebar entirely — the tool nav moved to the top bar, and the
 # LLM Tracker page has no sidebar widgets left. Hides both the collapsed
@@ -487,6 +494,42 @@ details[open].stExpander summary [data-testid="stExpanderToggleIcon"]::before {
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
+/* Signed-in chip — who you are, who else is on, and the way out. */
+.userchip {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  padding: 4px 10px 4px 12px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-family: 'Geist Mono', monospace;
+}
+.userchip-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 8px rgba(34,197,94,0.8);
+}
+.userchip-name {
+  color: var(--text-1);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+/* Hover reveals the other names via the title attribute — the chip stays
+   one line wide however many people are on. */
+.userchip-others {
+  color: var(--text-3);
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+  cursor: default;
+}
+.userchip-out {
+  color: var(--text-3);
+  text-decoration: none;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+  transition: color .15s ease;
+}
+.userchip-out:hover { color: var(--accent); }
 .tag {
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -1605,7 +1648,7 @@ components.html(
 # Top bar
 # ============================================================
 st.markdown(
-    """
+    f"""
     <div class="topbar">
       <div style="display:flex; align-items:center;">
         <div class="brand">
@@ -1614,7 +1657,10 @@ st.markdown(
         </div>
         <div class="topbar-meta">LLM Tracker · production</div>
       </div>
-      <div class="tag"><span class="live-dot"></span>Live</div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <div class="tag"><span class="live-dot"></span>Live</div>
+        {user_badge_html(st)}
+      </div>
     </div>
     """,
     unsafe_allow_html=True,

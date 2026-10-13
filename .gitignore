@@ -18,6 +18,8 @@ data/debug/
 # secrets — never commit
 # .env
 # .env.*
-```bash
-python -m ai_award.cli login --cdp
-```
+
+# login accounts and live sessions (password hashes / session tokens)
+data/users.json
+data/sessions.json
+# data/sessions.json.tmp

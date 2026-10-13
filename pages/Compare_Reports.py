@@ -43,6 +43,11 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# Login gate -- a page under pages/ has its own URL and is reachable
+# directly, so gating app.py alone would leave this one open.
+from core.auth import require_login  # noqa: E402
+require_login(st)
+
 
 # ============================================================
 # CSS — mirror the standalone dashboard palette:

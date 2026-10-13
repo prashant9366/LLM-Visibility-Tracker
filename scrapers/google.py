@@ -290,6 +290,10 @@ async def _ensure_session(headless: bool, slot: int = 0) -> dict:
         headless=False,  # AIO + bot-detection: always headed, like ChatGPT.
         viewport={"width": 1280, "height": 900},
         args=["--no-default-browser-check", *CRASH_BUBBLE_ARGS],
+        # Playwright defaults this to False, which injects --no-sandbox --
+        # a visible infobar and a cheap automation tell. Set in every
+        # module that launches its own context; see scrapers/chatgpt.py.
+        chromium_sandbox=True,
     )
     # Route through a proxy when one is configured (proxies.txt / PROXY_LIST).
     # Chosen per LAUNCH, not per keyword: the session is deliberately reused across

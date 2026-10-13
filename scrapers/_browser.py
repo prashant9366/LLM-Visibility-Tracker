@@ -22,6 +22,8 @@ import asyncio
 import json
 import os
 import re
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Callable
@@ -227,22 +229,100 @@ def _load_env_file() -> None:
 _load_env_file()
 
 
-def proxy_servers() -> list[str]:
-    """Configured proxies as 'host:port', from PROXY_LIST or a proxies file.
+# The BuyProxies account API. The URL embeds the account key, so it lives in
+# .env as BUYPROXIES_URL and never in source:
+#
+#     https://api.buyproxies.org/?a=showProxies&pid=...&key=...&port=12345
+#     -> 100 lines of  host:port:user:pass
+#
+# Cached to data/proxies.txt for PROXY_CACHE_TTL and refetched after that.
+# Refetching is the point: a hand-maintained list cannot tell you its exits
+# have been reassigned, so it goes quietly dead and every scrape fails for a
+# day before anyone looks. The API returns the account's CURRENT assignment.
+PROXY_CACHE = Path(__file__).resolve().parent.parent / "data" / "proxies.txt"
+PROXY_CACHE_TTL = 3600
+PROXY_FETCH_TIMEOUT = 30
 
-    PROXY_LIST="1.2.3.4:8000,5.6.7.8:8000"  takes precedence; otherwise the file at
-    PROXY_FILE (default: proxies.txt beside the app) is read, one per line, '#'
-    comments allowed. Empty result = no proxying, which is the default.
+_proxy_lock = threading.Lock()
+
+
+def _parse_proxy_lines(text: str) -> list[str]:
+    """host:port:user:pass -> ['host:port', ...], credentials into the env.
+
+    Every exit on one BuyProxies account shares the same user/pass (verified:
+    100 exits, one distinct credential pair), and proxy_config() already reads
+    PROXY_USER / PROXY_PASS separately -- so the credentials are lifted out of
+    the list and the list itself stays shareable.
+
+    setdefault, not assignment: anything already exported wins, which keeps a
+    manually overridden credential working.
+    """
+    servers: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        if len(parts) >= 4:
+            servers.append(f"{parts[0]}:{parts[1]}")
+            os.environ.setdefault("PROXY_USER", parts[2])
+            os.environ.setdefault("PROXY_PASS", ":".join(parts[3:]))
+        elif len(parts) == 2:
+            servers.append(line)
+    return servers
+
+
+def _proxies_from_api() -> list[str]:
+    """Fetch the account's exits, through the cache. [] when not configured."""
+    url = (os.getenv("BUYPROXIES_URL") or "").strip()
+    if not url:
+        return []
+    with _proxy_lock:
+        try:
+            age = time.time() - PROXY_CACHE.stat().st_mtime
+            if age < PROXY_CACHE_TTL:
+                return _parse_proxy_lines(PROXY_CACHE.read_text(encoding="utf-8"))
+        except OSError:
+            pass
+        try:
+            import requests
+            r = requests.get(url, timeout=PROXY_FETCH_TIMEOUT)
+            r.raise_for_status()
+            servers = _parse_proxy_lines(r.text)
+            if servers:
+                PROXY_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                PROXY_CACHE.write_text(r.text, encoding="utf-8")
+                return servers
+        except Exception:
+            pass
+        # API unreachable: a stale list beats no list. These exits usually
+        # still work -- the assignment changes rarely -- and failing over to
+        # "no proxy" would send every request from the server's own IP, which
+        # is the one thing the proxies exist to avoid.
+        try:
+            return _parse_proxy_lines(PROXY_CACHE.read_text(encoding="utf-8"))
+        except OSError:
+            return []
+
+
+def proxy_servers() -> list[str]:
+    """Configured proxies as 'host:port'.
+
+    In order: PROXY_LIST (explicit override), the BuyProxies API, then the
+    file at PROXY_FILE (default: proxies.txt beside the app). Empty result =
+    no proxying, which is still the default when nothing is configured.
     """
     raw = (os.getenv("PROXY_LIST") or "").strip()
     if raw:
         return [p.strip() for p in raw.split(",") if p.strip()]
+    got = _proxies_from_api()
+    if got:
+        return got
     path = (os.getenv("PROXY_FILE") or "").strip() or str(
         Path(__file__).resolve().parent.parent / "proxies.txt")
     try:
         with open(path, encoding="utf-8") as fh:
-            return [ln.strip() for ln in fh
-                    if ln.strip() and not ln.strip().startswith("#")]
+            return _parse_proxy_lines(fh.read())
     except OSError:
         return []
 
@@ -250,6 +330,30 @@ def proxy_servers() -> list[str]:
 def proxy_config(pick: str | None = None,
                  exclude: "set[str] | tuple[str, ...]" = ()) -> dict | None:
     """Playwright proxy dict, or None when no proxies are configured.
+
+    GOOGLE AIO ONLY. scrapers/google.py is the single caller, deliberately:
+    Google's SERP bot-detection is what the exits are there for. ChatGPT,
+    Gemini and Perplexity run direct and must stay that way --
+
+      * Gemini and Perplexity sit behind a SIGNED-IN profile. Moving an
+        established session onto a datacentre IP in another country is the
+        shape of a stolen cookie, and it gets the account challenged or
+        banned.
+      * Perplexity goes through Cloudflare via Camoufox; a datacentre exit
+        raises the challenge rate rather than lowering it. Anonymous ChatGPT
+        is the same story -- it was tried there on 2026-10-13 and removed,
+        see the note in scrapers/chatgpt.py.
+      * they are not IP-rate-limited the way a bare SERP scrape is, so the
+        exits would buy nothing and cost a hop each way.
+
+    REGION: every exit in the pool is a US datacentre IP (ColoCrossing), so
+    anything routed through here answers as a US visitor. Google AIO can
+    accept that because the SERP is fetched with explicit `gl`/`hl`
+    parameters that pin the region regardless of exit. A chat UI has no such
+    override, so proxying one trades the Indian region away outright --
+    which, on machines that already egress from India, is a pure loss.
+
+    Do not widen this to other platforms without re-testing those accounts.
 
     Credentials come from PROXY_USER / PROXY_PASS (env or .env) — never from the
     proxy list itself, so the list can be committed/shared without leaking them.
@@ -362,6 +466,13 @@ async def persistent_context(
             user_data_dir=user_dir,
             headless=headless,
             viewport={"width": 1280, "height": 900},
+            # Playwright defaults chromium_sandbox to False, which injects
+            # --no-sandbox. Chrome then shows the yellow "unsupported
+            # command-line flag" infobar, and that flag is one of the
+            # cheapest automation tells there is -- ChatGPT's Turnstile
+            # answers it with "An error occurred during verification".
+            # A real browser runs sandboxed, so this one does too.
+            chromium_sandbox=True,
         )
         if use_patchright:
             # Real Chrome avoids the bundled-Chromium fingerprint that

@@ -261,6 +261,10 @@ async def _ensure_session() -> dict:
         headless=False,  # SERP bot-detection: always headed, like the AIO scraper.
         viewport={"width": 1280, "height": 900},
         args=["--no-default-browser-check"],
+        # Playwright defaults this to False, which injects --no-sandbox --
+        # a visible infobar and a cheap automation tell. Set in every
+        # module that launches its own context; see scrapers/chatgpt.py.
+        chromium_sandbox=True,
     )
     if _HAS_PATCHRIGHT:
         kwargs["channel"] = "chrome"
